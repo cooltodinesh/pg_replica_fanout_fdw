@@ -7,7 +7,7 @@ OBJS = src/pg_replica_fanout_fdw.o src/option.o src/connection.o src/deparse.o \
 EXTENSION = pg_replica_fanout_fdw
 DATA = sql/pg_replica_fanout_fdw--0.1.0.sql
 
-REGRESS = basic slicing types_nulls errors
+REGRESS = basic slicing types_nulls errors invalidation
 REGRESS_OPTS = --inputdir=test --outputdir=test
 
 PG_CONFIG = pg_config

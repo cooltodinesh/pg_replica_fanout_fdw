@@ -13,6 +13,14 @@ SELECT * FROM small_ft
 EXCEPT
 SELECT * FROM small_t;
 
+-- two concurrently-live foreign scans on the same server (self-join) must
+-- raise a clear error, not a bare libpq "another command is already in
+-- progress" message.
+SELECT count(*) FROM small_ft a JOIN small_ft b USING (id);
+
+-- a single scan node, rescanned many times (correlated subquery), remains
+-- legal -- see slicing.sql for the full rescan test.
+
 -- validator: missing required "replicas" option
 CREATE SERVER v_missing_replicas FOREIGN DATA WRAPPER pg_replica_fanout_fdw
   OPTIONS (dbname 'postgres');

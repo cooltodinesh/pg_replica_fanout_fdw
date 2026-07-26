@@ -32,3 +32,17 @@ SELECT count(*) FROM (SELECT * FROM types_ft EXCEPT SELECT * FROM types_t) x;
 SELECT count(*) FROM (SELECT * FROM types_t EXCEPT SELECT * FROM types_ft) x;
 
 SELECT * FROM types_ft ORDER BY id NULLS LAST, big NULLS LAST;
+
+-- column_name remap: the foreign table's local column name differs from
+-- the remote one, and the deparsed SELECT must use the remote name.
+CREATE FOREIGN TABLE types_ft2 (
+  id          int4,
+  body        text OPTIONS (column_name 't')
+) SERVER loopback OPTIONS (table_name 'types_t', min_blocks_per_slice '1');
+
+SELECT count(*) FROM (
+  SELECT id, body FROM types_ft2 EXCEPT SELECT id, t FROM types_t
+) x;
+SELECT count(*) FROM (
+  SELECT id, t FROM types_t EXCEPT SELECT id, body FROM types_ft2
+) x;

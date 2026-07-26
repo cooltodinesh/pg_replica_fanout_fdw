@@ -9,6 +9,8 @@
  */
 #include "postgres.h"
 
+#include "commands/defrem.h"
+#include "foreign/foreign.h"
 #include "lib/stringinfo.h"
 #include "utils/builtins.h"
 #include "utils/lsyscache.h"
@@ -20,7 +22,9 @@
  *		Build "SELECT <cols|NULL> FROM <schema>.<table>", with no WHERE
  *		clause yet -- RepFdwBuildBoundedSql appends the per-slice ctid
  *		bound.  retrieved_attrs is a list of ascending attnums (as produced
- *		by GetForeignPlan from the plan-time attrs_used bitmap).
+ *		by GetForeignPlan from the plan-time attrs_used bitmap).  A column's
+ *		"column_name" option, if set, is used as the remote name instead of
+ *		the local attribute name.
  */
 char *
 RepFdwDeparseTemplate(Oid foreigntableid, List *retrieved_attrs,
@@ -40,11 +44,26 @@ RepFdwDeparseTemplate(Oid foreigntableid, List *retrieved_attrs,
 		foreach(lc, retrieved_attrs)
 		{
 			int			attnum = lfirst_int(lc);
-			char	   *attname = get_attname(foreigntableid, attnum, false);
+			List	   *coloptions = GetForeignColumnOptions(foreigntableid, attnum);
+			char	   *remotename = NULL;
+			ListCell   *lc2;
+
+			foreach(lc2, coloptions)
+			{
+				DefElem    *def = (DefElem *) lfirst(lc2);
+
+				if (strcmp(def->defname, "column_name") == 0)
+				{
+					remotename = defGetString(def);
+					break;
+				}
+			}
+			if (remotename == NULL)
+				remotename = get_attname(foreigntableid, attnum, false);
 
 			if (!first)
 				appendStringInfoString(&buf, ", ");
-			appendStringInfoString(&buf, quote_identifier(attname));
+			appendStringInfoString(&buf, quote_identifier(remotename));
 			first = false;
 		}
 	}

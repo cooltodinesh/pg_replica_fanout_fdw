@@ -1,8 +1,27 @@
 -- errors.sql: a server whose replicas include an unreachable host errors
 -- cleanly, names the offending replica, and respects connect_timeout
 -- instead of hanging.
+\i test/loopback-setup.sql
+-- test/loopback-setup.sql
+--
+-- Shared setup for the loopback regress suites: point all three "replicas"
+-- at the same local instance.  Disjoint ctid slices still union to exactly
+-- the whole table, so slicing/fan-out/merge are fully exercised on one
+-- instance.  Idempotent, safe to \i at the top of any suite.
+-- Idempotent by design (IF NOT EXISTS throughout, no DROP/CASCADE): this
+-- file is \i'd at the top of every suite, and suites run sequentially
+-- against the same regression database.
 CREATE EXTENSION IF NOT EXISTS pg_replica_fanout_fdw;
-NOTICE:  extension "pg_replica_fanout_fdw" already exists, skipping
+psql:test/loopback-setup.sql:10: NOTICE:  extension "pg_replica_fanout_fdw" already exists, skipping
+CREATE SERVER IF NOT EXISTS loopback FOREIGN DATA WRAPPER pg_replica_fanout_fdw
+  OPTIONS (replicas 'localhost:5432,localhost:5432,localhost:5432',
+           consistency 'none');
+psql:test/loopback-setup.sql:14: NOTICE:  server "loopback" already exists, skipping
+CREATE USER MAPPING IF NOT EXISTS FOR CURRENT_USER SERVER loopback;
+psql:test/loopback-setup.sql:16: NOTICE:  user mapping for "user" already exists for server "loopback", skipping
+-- Assumes 10.255.255.1:5999 is blackholed (times out) rather than actively
+-- refused on the CI/dev host; a host that rejects it immediately would
+-- produce a different message/timing and diff against the expected output.
 DROP SERVER IF EXISTS bad_loopback CASCADE;
 NOTICE:  server "bad_loopback" does not exist, skipping
 CREATE SERVER bad_loopback FOREIGN DATA WRAPPER pg_replica_fanout_fdw
@@ -14,3 +33,17 @@ CREATE FOREIGN TABLE err_ft (id int)
   SERVER bad_loopback OPTIONS (table_name 'err_t');
 SELECT * FROM err_ft;
 ERROR:  timed out connecting to replica(s): 10.255.255.1:5999
+-- a query-level remote error (missing relation) on an otherwise-healthy
+-- connection must not kill it: the next query on the same session must
+-- still succeed on the reused connection, not pay for a reconnect.
+CREATE FOREIGN TABLE missing_ft (id int)
+  SERVER loopback OPTIONS (table_name 'does_not_exist');
+SELECT * FROM missing_ft;
+ERROR:  relation "public.does_not_exist" does not exist
+CONTEXT:  remote SQL command (replica localhost:5432): SELECT pg_relation_size('public.does_not_exist'::regclass)
+SELECT count(*) FROM small_ft;
+ count 
+-------
+     5
+(1 row)
+

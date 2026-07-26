@@ -82,7 +82,10 @@ RepFdwNextTuple(RepFdwScanState *fsstate, ForeignScanState *node)
 
 				if (rconn->paused &&
 					RepFdwQueuedRowCount(rconn) <= fsstate->fetch_size)
+				{
 					rconn->paused = false;
+					fsstate->wes_dirty = true;
+				}
 
 				ExecStoreHeapTuple(tuple, slot, false);
 				return slot;
@@ -99,7 +102,7 @@ RepFdwNextTuple(RepFdwScanState *fsstate, ForeignScanState *node)
 		{
 			MemoryContext oldcxt = MemoryContextSwitchTo(fsstate->batch_cxt);
 
-			RepStreamPump(fsstate->rset, nslices, fsstate->fetch_size);
+			RepStreamPump(fsstate);
 			MemoryContextSwitchTo(oldcxt);
 		}
 	}

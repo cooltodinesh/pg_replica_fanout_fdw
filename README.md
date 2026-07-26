@@ -50,6 +50,7 @@ contribute I/O too, just list it in `replicas` like any other node.
 | `table_name` | FOREIGN TABLE | the foreign table's own name | |
 | `schema_name` | FOREIGN TABLE | the foreign table's own schema | |
 | `min_blocks_per_slice` | FOREIGN TABLE | 128 | anti-over-slicing guard; lower it (e.g. `1`) to force multi-way splits in tests on small tables |
+| `column_name` | COLUMN | the column's own name | remote column name, if it differs from the local one |
 
 ## Known limitations (Phase A)
 
@@ -63,6 +64,16 @@ contribute I/O too, just list it in `replicas` like any other node.
   under its own `REPEATABLE READ` snapshot with no cross-replica skew
   bound. Any connect or scan failure is a plain `ERROR` — there is no
   degraded/redistribute mode.
+- **Slice bounds are sized from replica 0 only.** `nblocks` (and hence
+  every slice's ctid range) is discovered by asking replica 0 for
+  `pg_relation_size()`, once, at the start of the scan. If a *different*
+  replica is lagging and hasn't replayed out to that block count yet, the
+  middle slices it's assigned (bounded on both sides) can silently return
+  fewer rows than expected for blocks it hasn't caught up to. The
+  open-ended first and last slices (`ctid < hi` / `ctid >= lo`, no other
+  bound) aren't affected the same way since they cover whatever the
+  replica actually has. There's no cross-replica alignment to fix this in
+  `consistency='none'` — that needs LSN-based coordination.
 - **One live scan per replica connection.** Each cached connection
   streams a single chunked query at a time (`PQsendQuery` +
   `PQsetChunkedRowsMode`), so it can't serve two concurrently-active

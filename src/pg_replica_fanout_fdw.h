@@ -76,6 +76,8 @@ typedef struct ReplicaConn
 	bool		paused;			/* backpressure: temporarily not polled */
 } ReplicaConn;
 
+struct RepFdwScanState;
+
 /* cached per user-mapping; keyed by user mapping OID in a process-local HTAB */
 typedef struct ReplicaSet
 {
@@ -83,6 +85,13 @@ typedef struct ReplicaSet
 	int			nconns;
 	ReplicaConn *conns;			/* array[nconns] */
 	bool		xact_open;		/* remote REPEATABLE READ READ ONLY open on all */
+	struct RepFdwScanState *active_scan;	/* non-NULL => a scan owns these
+											 * conns; only one live scan per
+											 * server is supported */
+	uint32		server_hashvalue;	/* GetSysCacheHashValue1(FOREIGNSERVEROID) */
+	uint32		mapping_hashvalue;	/* GetSysCacheHashValue1(USERMAPPINGOID) */
+	bool		invalidated;	/* an ALTER touched this server/mapping;
+								 * conns need to be rebuilt when it's safe */
 } ReplicaSet;
 
 /* fdw_private (plan -> exec): {sql_template, retrieved_attrs} */
@@ -112,6 +121,11 @@ typedef struct RepFdwScanState
 	MemoryContext row_cxt;		/* reset per output row */
 
 	bool		eof;
+
+	/* persistent streaming WaitEventSet -- see RepStreamPump */
+	WaitEventSet *stream_wes;
+	bool		wes_dirty;		/* active-socket membership changed since
+								 * stream_wes was last built */
 } RepFdwScanState;
 
 /* in option.c */
@@ -123,7 +137,7 @@ extern ReplicaSet *RepFdwGetConnections(UserMapping *user, RepFdwOptions *opts);
 extern void RepFdwBeginRemoteXact(ReplicaSet *rset);
 extern void RepFdwStartQueries(ReplicaSet *rset, int nactive, char **sqls,
 								RepFdwCtidBound *bounds, int fetch_size);
-extern void RepStreamPump(ReplicaSet *rset, int nactive, int fetch_size);
+extern void RepStreamPump(struct RepFdwScanState *fsstate);
 extern int	RepFdwQueuedRowCount(ReplicaConn *rconn);
 extern void RepFdwCancelAndDrain(ReplicaSet *rset, int nactive);
 extern PGresult *RepFdwExecSync(ReplicaConn *rconn, const char *sql);

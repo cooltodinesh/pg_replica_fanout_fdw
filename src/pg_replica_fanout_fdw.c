@@ -111,8 +111,18 @@ repfdwGetForeignRelSize(PlannerInfo *root, RelOptInfo *baserel,
 
 /*
  * repfdwGetForeignPaths
- *		A single path: bill it at roughly (scan cost / N replicas), which is
- *		the whole point of fanning the scan out.
+ *		A single path, costed as (page cost / N replicas) + per-row cost --
+ *		intended to make the planner prefer this FDW over a plain seqscan
+ *		roughly in proportion to the fan-out.  In practice baserel->pages is
+ *		0 for any foreign table that has never been ANALYZEd (there's no
+ *		AnalyzeForeignTable callback here to populate pg_class.relpages), so
+ *		the page-cost term -- and hence this whole division by nreplicas --
+ *		is usually a no-op; only the flat per-row term ends up mattering.
+ *		This is a real limitation of the cost model, not just a comment
+ *		nicety: don't rely on EXPLAIN cost numbers to judge the fan-out
+ *		benefit. Fixing it (e.g. a crude remote pg_relation_size-based
+ *		estimate) would need a planning-time round-trip and is out of scope
+ *		here.
  */
 static void
 repfdwGetForeignPaths(PlannerInfo *root, RelOptInfo *baserel,
@@ -244,6 +254,17 @@ repfdwBeginForeignScan(ForeignScanState *node, int eflags)
 	fsstate->fetch_size = opts->fetch_size;
 
 	fsstate->rset = RepFdwGetConnections(user, opts);
+
+	if (fsstate->rset->active_scan != NULL &&
+		fsstate->rset->active_scan != fsstate)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("pg_replica_fanout_fdw cannot run two concurrent scans on foreign server \"%s\"",
+						server->servername),
+				 errdetail("Each replica connection streams one query at a time, so only one foreign scan per server can be live at once."),
+				 errhint("Rewrite so a single scan of this server is active at a time (e.g. materialize one side with a CTE, or place the tables on separate servers).")));
+	fsstate->rset->active_scan = fsstate;
+
 	RepFdwBeginRemoteXact(fsstate->rset);
 
 	fsstate->nblocks = RepFdwGetNBlocks(fsstate->rset, opts->schema_name,
@@ -297,6 +318,15 @@ repfdwReScanForeignScan(ForeignScanState *node)
 		return;
 
 	RepFdwCancelAndDrain(fsstate->rset, fsstate->nslices);
+
+	/* active-socket membership resets when the queries are resent */
+	if (fsstate->stream_wes != NULL)
+	{
+		FreeWaitEventSet(fsstate->stream_wes);
+		fsstate->stream_wes = NULL;
+	}
+	fsstate->wes_dirty = false;
+
 	RepFdwStartQueries(fsstate->rset, fsstate->nslices, fsstate->replica_sqls,
 					   fsstate->replica_bounds, fsstate->fetch_size);
 	fsstate->rr_cursor = 0;
@@ -317,6 +347,12 @@ repfdwEndForeignScan(ForeignScanState *node)
 		return;
 
 	RepFdwCancelAndDrain(fsstate->rset, fsstate->nslices);
+
+	if (fsstate->rset != NULL && fsstate->rset->active_scan == fsstate)
+		fsstate->rset->active_scan = NULL;
+
+	if (fsstate->stream_wes != NULL)
+		FreeWaitEventSet(fsstate->stream_wes);
 
 	if (fsstate->batch_cxt)
 		MemoryContextDelete(fsstate->batch_cxt);

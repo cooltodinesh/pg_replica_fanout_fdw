@@ -16,7 +16,9 @@
 #include "miscadmin.h"
 #include "storage/ipc.h"
 #include "utils/hsearch.h"
+#include "utils/inval.h"
 #include "utils/memutils.h"
+#include "utils/syscache.h"
 #include "utils/timestamp.h"
 #include "utils/wait_event.h"
 
@@ -36,13 +38,15 @@ static HTAB *ReplicaSetHash = NULL;
 static MemoryContext RepFdwCacheContext = NULL;
 
 static void pgreplicafdw_xact_callback(XactEvent event, void *arg);
+static void rep_inval_callback(Datum arg, SysCacheIdentifier cacheid,
+								uint32 hashvalue);
 static void ensure_connected(ReplicaSet *rset, RepFdwOptions *opts,
 							  UserMapping *user);
 static PGconn *start_connect(ReplicaConn *rconn, RepFdwOptions *opts,
 							  UserMapping *user);
-static void abort_pending_connects(ReplicaSet *rset,
-									PostgresPollingStatusType *pollstatus);
+static void abort_pending_connects(ReplicaSet *rset);
 static void drain_conn(ReplicaConn *rconn, int fetch_size);
+static void destroy_replicaset_conns(ReplicaSet *rset);
 
 /*
  * RepFdwGetConnections
@@ -75,9 +79,37 @@ RepFdwGetConnections(UserMapping *user, RepFdwOptions *opts)
 									 HASH_ELEM | HASH_BLOBS);
 
 		RegisterXactCallback(pgreplicafdw_xact_callback, NULL);
+		CacheRegisterSyscacheCallback(FOREIGNSERVEROID, rep_inval_callback,
+									  (Datum) 0);
+		CacheRegisterSyscacheCallback(USERMAPPINGOID, rep_inval_callback,
+									  (Datum) 0);
 	}
 
-	rset = (ReplicaSet *) hash_search(ReplicaSetHash, &key, HASH_ENTER, &found);
+	for (;;)
+	{
+		rset = (ReplicaSet *) hash_search(ReplicaSetHash, &key, HASH_ENTER, &found);
+
+		if (found && rset->invalidated)
+		{
+			/*
+			 * ALTER SERVER / ALTER USER MAPPING touched this entry.  If
+			 * nothing is using it right now, tear it down and loop back to
+			 * rebuild it from scratch with fresh options below.  If a scan
+			 * or remote transaction is still active, leave it as-is for
+			 * this transaction; pgreplicafdw_xact_callback tears it down at
+			 * xact end instead, since we can't drop connections a scan is
+			 * mid-read on.
+			 */
+			if (rset->active_scan == NULL && !rset->xact_open)
+			{
+				destroy_replicaset_conns(rset);
+				hash_search(ReplicaSetHash, &key, HASH_REMOVE, NULL);
+				continue;
+			}
+		}
+		break;
+	}
+
 	if (!found)
 	{
 		int			nconns = list_length(opts->replicas);
@@ -87,6 +119,14 @@ RepFdwGetConnections(UserMapping *user, RepFdwOptions *opts)
 
 		rset->nconns = nconns;
 		rset->xact_open = false;
+		rset->active_scan = NULL;
+		rset->invalidated = false;
+		rset->server_hashvalue =
+			GetSysCacheHashValue1(FOREIGNSERVEROID,
+								  ObjectIdGetDatum(user->serverid));
+		rset->mapping_hashvalue =
+			GetSysCacheHashValue1(USERMAPPINGOID,
+								  ObjectIdGetDatum(user->umid));
 
 		oldcxt = MemoryContextSwitchTo(RepFdwCacheContext);
 		rset->conns = palloc0_array(ReplicaConn, nconns);
@@ -177,7 +217,7 @@ start_connect(ReplicaConn *rconn, RepFdwOptions *opts, UserMapping *user)
  *		an error.  Prevents leaking sockets/external-FD slots.
  */
 static void
-abort_pending_connects(ReplicaSet *rset, PostgresPollingStatusType *pollstatus)
+abort_pending_connects(ReplicaSet *rset)
 {
 	int			i;
 
@@ -195,18 +235,65 @@ abort_pending_connects(ReplicaSet *rset, PostgresPollingStatusType *pollstatus)
 }
 
 /*
+ * destroy_replicaset_conns
+ *		Disconnect every connection in a ReplicaSet and free the per-conn
+ *		allocations backing it (the conns array and each host string, both
+ *		palloc'd out of RepFdwCacheContext).  Used when rebuilding an
+ *		invalidated entry -- nconns/replicas may have changed, so the array
+ *		can't just be reused in place.  Does not touch the hash entry
+ *		itself; the caller removes or repopulates it.
+ */
+static void
+destroy_replicaset_conns(ReplicaSet *rset)
+{
+	int			i;
+
+	for (i = 0; i < rset->nconns; i++)
+	{
+		ReplicaConn *rconn = &rset->conns[i];
+		ListCell   *lc;
+
+		if (rconn->conn != NULL)
+		{
+			libpqsrv_disconnect(rconn->conn);
+			rconn->conn = NULL;
+		}
+
+		foreach(lc, rconn->rowqueue)
+			PQclear((PGresult *) lfirst(lc));
+		list_free(rconn->rowqueue);
+
+		if (rconn->host != NULL)
+			pfree(rconn->host);
+	}
+
+	if (rset->conns != NULL)
+		pfree(rset->conns);
+	rset->conns = NULL;
+	rset->nconns = 0;
+}
+
+/*
  * ensure_connected
  *		Concurrently (re)connect every replica that isn't currently usable.
  *		On any failure or timeout, ereport(ERROR) naming the offending
  *		replica; there is no degraded mode (a failed replica fails the scan).
+ *
+ *		The WaitEventSet is built once and reused across wakeups, rebuilt
+ *		only when the in-flight connection count drops (a conn reached OK
+ *		or FAILED) -- not on every wakeup.  To avoid also having to rebuild
+ *		on every read/write direction flip, in-flight conns are always
+ *		registered for both WL_SOCKET_READABLE and WL_SOCKET_WRITEABLE and
+ *		PQconnectPoll() is left to sort out which one actually applies.
  */
 static void
 ensure_connected(ReplicaSet *rset, RepFdwOptions *opts, UserMapping *user)
 {
 	int			i;
 	int			nneed = 0;
-	PostgresPollingStatusType *pollstatus;
 	TimestampTz endtime;
+	WaitEventSet *wes = NULL;
+	int			wes_nleft = -1;
 
 	for (i = 0; i < rset->nconns; i++)
 		if (rset->conns[i].state == REP_DISCONNECTED ||
@@ -216,15 +303,11 @@ ensure_connected(ReplicaSet *rset, RepFdwOptions *opts, UserMapping *user)
 	if (nneed == 0)
 		return;
 
-	pollstatus = palloc(sizeof(PostgresPollingStatusType) * rset->nconns);
-
 	PG_TRY();
 	{
 		for (i = 0; i < rset->nconns; i++)
 		{
 			ReplicaConn *rconn = &rset->conns[i];
-
-			pollstatus[i] = PGRES_POLLING_WRITING;
 
 			if (rconn->state != REP_DISCONNECTED && rconn->state != REP_DEAD)
 				continue;
@@ -244,7 +327,6 @@ ensure_connected(ReplicaSet *rset, RepFdwOptions *opts, UserMapping *user)
 
 		for (;;)
 		{
-			WaitEventSet *wes;
 			WaitEvent	occurred[REP_MAX_WAIT_EVENTS];
 			int			noccurred;
 			int			nleft = 0;
@@ -268,36 +350,42 @@ ensure_connected(ReplicaSet *rset, RepFdwOptions *opts, UserMapping *user)
 										 hosts.len ? ", " : "",
 										 rset->conns[i].host,
 										 rset->conns[i].port);
-				abort_pending_connects(rset, pollstatus);
+				abort_pending_connects(rset);
 				ereport(ERROR,
 						(errcode(ERRCODE_CONNECTION_FAILURE),
 						 errmsg("timed out connecting to replica(s): %s",
 								hosts.data)));
 			}
 
-			wes = CreateWaitEventSet(CurrentResourceOwner, rset->nconns + 2);
-			AddWaitEventToSet(wes, WL_EXIT_ON_PM_DEATH, PGINVALID_SOCKET,
-							  NULL, NULL);
-			AddWaitEventToSet(wes, WL_LATCH_SET, PGINVALID_SOCKET,
-							  MyLatch, NULL);
-
-			for (i = 0; i < rset->nconns; i++)
+			if (wes == NULL || nleft != wes_nleft)
 			{
-				ReplicaConn *rconn = &rset->conns[i];
-				uint32		ev;
+				if (wes != NULL)
+					FreeWaitEventSet(wes);
 
-				if (rconn->state != REP_CONNECTING)
-					continue;
+				wes = CreateWaitEventSet(CurrentResourceOwner, rset->nconns + 2);
+				AddWaitEventToSet(wes, WL_EXIT_ON_PM_DEATH, PGINVALID_SOCKET,
+								  NULL, NULL);
+				AddWaitEventToSet(wes, WL_LATCH_SET, PGINVALID_SOCKET,
+								  MyLatch, NULL);
 
-				ev = (pollstatus[i] == PGRES_POLLING_READING) ?
-					WL_SOCKET_READABLE : WL_SOCKET_WRITEABLE;
-				AddWaitEventToSet(wes, ev, PQsocket(rconn->conn), NULL, rconn);
+				for (i = 0; i < rset->nconns; i++)
+				{
+					ReplicaConn *rconn = &rset->conns[i];
+
+					if (rconn->state != REP_CONNECTING)
+						continue;
+
+					AddWaitEventToSet(wes,
+									  WL_SOCKET_READABLE | WL_SOCKET_WRITEABLE,
+									  PQsocket(rconn->conn), NULL, rconn);
+				}
+
+				wes_nleft = nleft;
 			}
 
 			noccurred = WaitEventSetWait(wes, timeout_ms, occurred,
 										 Min(rset->nconns + 2, REP_MAX_WAIT_EVENTS),
 										 we_connect);
-			FreeWaitEventSet(wes);
 
 			for (i = 0; i < noccurred; i++)
 			{
@@ -312,21 +400,21 @@ ensure_connected(ReplicaSet *rset, RepFdwOptions *opts, UserMapping *user)
 				if (w->events & (WL_SOCKET_READABLE | WL_SOCKET_WRITEABLE))
 				{
 					ReplicaConn *rconn = (ReplicaConn *) w->user_data;
-					int			idx = rconn->index;
+					PostgresPollingStatusType status;
 
-					pollstatus[idx] = PQconnectPoll(rconn->conn);
+					status = PQconnectPoll(rconn->conn);
 
-					if (pollstatus[idx] == PGRES_POLLING_OK)
+					if (status == PGRES_POLLING_OK)
 					{
 						rconn->state = REP_IN_TXN;
 					}
-					else if (pollstatus[idx] == PGRES_POLLING_FAILED)
+					else if (status == PGRES_POLLING_FAILED)
 					{
 						char	   *msg = pstrdup(PQerrorMessage(rconn->conn));
 						char	   *host = pstrdup(rconn->host);
 						int			port = rconn->port;
 
-						abort_pending_connects(rset, pollstatus);
+						abort_pending_connects(rset);
 						ereport(ERROR,
 								(errcode(ERRCODE_SQLCLIENT_UNABLE_TO_ESTABLISH_SQLCONNECTION),
 								 errmsg("could not connect to replica \"%s:%d\"",
@@ -336,15 +424,19 @@ ensure_connected(ReplicaSet *rset, RepFdwOptions *opts, UserMapping *user)
 				}
 			}
 		}
+
+		if (wes != NULL)
+		{
+			FreeWaitEventSet(wes);
+			wes = NULL;
+		}
 	}
 	PG_CATCH();
 	{
-		abort_pending_connects(rset, pollstatus);
+		abort_pending_connects(rset);
 		PG_RE_THROW();
 	}
 	PG_END_TRY();
-
-	pfree(pollstatus);
 }
 
 /*
@@ -523,10 +615,19 @@ drain_conn(ReplicaConn *rconn, int fetch_size)
  *		Advance the streaming loop until at least one replica makes
  *		progress (gains a queued chunk or finishes) or there is nothing
  *		left to wait for.
+ *
+ *		The WaitEventSet is cached on fsstate and reused across calls,
+ *		rebuilt only when active-socket membership has changed (a conn
+ *		finished, or its pause state flipped -- see wes_dirty) rather than
+ *		on every call, which is what made this the hot path's main source
+ *		of epoll_create/close churn on a large scan.
  */
 void
-RepStreamPump(ReplicaSet *rset, int nactive, int fetch_size)
+RepStreamPump(RepFdwScanState *fsstate)
 {
+	ReplicaSet *rset = fsstate->rset;
+	int			nactive = fsstate->nslices;
+	int			fetch_size = fsstate->fetch_size;
 	int			i;
 	int			nevents;
 
@@ -538,17 +639,20 @@ RepStreamPump(ReplicaSet *rset, int nactive, int fetch_size)
 	if (nevents == 0)
 		return;
 
-	for (;;)
+	if (fsstate->stream_wes == NULL || fsstate->wes_dirty)
 	{
-		WaitEventSet *wes;
-		WaitEvent	occurred[REP_MAX_WAIT_EVENTS];
-		int			noccurred;
-		bool		made_progress = false;
+		if (fsstate->stream_wes != NULL)
+		{
+			FreeWaitEventSet(fsstate->stream_wes);
+			fsstate->stream_wes = NULL;
+		}
 
-		wes = CreateWaitEventSet(CurrentResourceOwner, nactive + 2);
-		AddWaitEventToSet(wes, WL_EXIT_ON_PM_DEATH, PGINVALID_SOCKET,
-						  NULL, NULL);
-		AddWaitEventToSet(wes, WL_LATCH_SET, PGINVALID_SOCKET, MyLatch, NULL);
+		fsstate->stream_wes = CreateWaitEventSet(CurrentResourceOwner,
+												 nactive + 2);
+		AddWaitEventToSet(fsstate->stream_wes, WL_EXIT_ON_PM_DEATH,
+						  PGINVALID_SOCKET, NULL, NULL);
+		AddWaitEventToSet(fsstate->stream_wes, WL_LATCH_SET, PGINVALID_SOCKET,
+						  MyLatch, NULL);
 
 		for (i = 0; i < nactive; i++)
 		{
@@ -557,14 +661,22 @@ RepStreamPump(ReplicaSet *rset, int nactive, int fetch_size)
 			if (rconn->state != REP_STREAMING || rconn->paused)
 				continue;
 
-			AddWaitEventToSet(wes, WL_SOCKET_READABLE, PQsocket(rconn->conn),
-							  NULL, rconn);
+			AddWaitEventToSet(fsstate->stream_wes, WL_SOCKET_READABLE,
+							  PQsocket(rconn->conn), NULL, rconn);
 		}
 
-		noccurred = WaitEventSetWait(wes, -1, occurred,
+		fsstate->wes_dirty = false;
+	}
+
+	for (;;)
+	{
+		WaitEvent	occurred[REP_MAX_WAIT_EVENTS];
+		int			noccurred;
+		bool		made_progress = false;
+
+		noccurred = WaitEventSetWait(fsstate->stream_wes, -1, occurred,
 									 Min(nactive + 2, REP_MAX_WAIT_EVENTS),
 									 we_stream);
-		FreeWaitEventSet(wes);
 
 		for (i = 0; i < noccurred; i++)
 		{
@@ -581,8 +693,13 @@ RepStreamPump(ReplicaSet *rset, int nactive, int fetch_size)
 				ReplicaConn *rconn = (ReplicaConn *) w->user_data;
 				int			before_rows = RepFdwQueuedRowCount(rconn);
 				RepConnState before_state = rconn->state;
+				bool		paused_before = rconn->paused;
 
 				drain_conn(rconn, fetch_size);
+
+				if (rconn->state != before_state ||
+					rconn->paused != paused_before)
+					fsstate->wes_dirty = true;
 
 				if (rconn->state != before_state ||
 					RepFdwQueuedRowCount(rconn) != before_rows)
@@ -657,7 +774,11 @@ RepFdwCancelAndDrain(ReplicaSet *rset, int nactive)
 /*
  * RepFdwReportError
  *		Report a remote error or connection failure, always as ERROR,
- *		naming the offending replica.  Marks the connection dead.
+ *		naming the offending replica.  Only marks the connection REP_DEAD
+ *		when the socket itself is no longer usable; a benign query-level
+ *		error (e.g. relation does not exist) on an otherwise-healthy
+ *		connection is drained back to idle instead, so the next statement
+ *		can reuse it rather than paying for a reconnect.
  */
 void
 RepFdwReportError(PGresult *res, ReplicaConn *rconn, const char *sql)
@@ -666,7 +787,10 @@ RepFdwReportError(PGresult *res, ReplicaConn *rconn, const char *sql)
 	char	   *message_primary = res ? PQresultErrorField(res, PG_DIAG_MESSAGE_PRIMARY) : NULL;
 	char	   *message_detail = res ? PQresultErrorField(res, PG_DIAG_MESSAGE_DETAIL) : NULL;
 	char	   *message_hint = res ? PQresultErrorField(res, PG_DIAG_MESSAGE_HINT) : NULL;
+	char	   *ctxmsg;
 	int			sqlstate;
+	bool		conn_ok = (rconn->conn != NULL &&
+						   PQstatus(rconn->conn) == CONNECTION_OK);
 
 	if (diag_sqlstate)
 		sqlstate = MAKE_SQLSTATE(diag_sqlstate[0], diag_sqlstate[1],
@@ -675,10 +799,47 @@ RepFdwReportError(PGresult *res, ReplicaConn *rconn, const char *sql)
 	else
 		sqlstate = ERRCODE_CONNECTION_FAILURE;
 
+	/*
+	 * The message fields above point into res; copy the ones we still need so
+	 * we can PQclear(res) now rather than leaking it when we longjmp out via
+	 * ereport() below.
+	 */
+	if (message_primary)
+		message_primary = pstrdup(message_primary);
+	if (message_detail)
+		message_detail = pstrdup(message_detail);
+	if (message_hint)
+		message_hint = pstrdup(message_hint);
+	if (res)
+		PQclear(res);
+
 	if (message_primary == NULL && rconn->conn != NULL)
 		message_primary = pchomp(PQerrorMessage(rconn->conn));
 
-	rconn->state = REP_DEAD;
+	if (conn_ok)
+	{
+		/*
+		 * The socket is fine; this was a query-level error, not a
+		 * connection failure.  Drain to the terminating NULL result so
+		 * libpq's asyncStatus returns to IDLE (a FATAL_ERROR result does
+		 * not do this by itself), and leave the connection usable.  Ignore
+		 * whatever turns up here -- we're already erroring out, and this
+		 * must not itself recurse back into RepFdwReportError.
+		 */
+		PGresult   *r;
+
+		while ((r = libpqsrv_get_result(rconn->conn, we_stream)) != NULL)
+			PQclear(r);
+		rconn->state = REP_IN_TXN;
+	}
+	else
+		rconn->state = REP_DEAD;
+
+	if (sql)
+		ctxmsg = psprintf("remote SQL command (replica %s:%d): %s",
+						  rconn->host, rconn->port, sql);
+	else
+		ctxmsg = psprintf("replica %s:%d", rconn->host, rconn->port);
 
 	ereport(ERROR,
 			(errcode(sqlstate),
@@ -687,10 +848,7 @@ RepFdwReportError(PGresult *res, ReplicaConn *rconn, const char *sql)
 			 errmsg("could not obtain message string for remote error"),
 			 message_detail ? errdetail_internal("%s", message_detail) : 0,
 			 message_hint ? errhint("%s", message_hint) : 0,
-			 sql ?
-			 errcontext("remote SQL command (replica %s:%d): %s",
-						rconn->host, rconn->port, sql) :
-			 errcontext("replica %s:%d", rconn->host, rconn->port)));
+			 errcontext("%s", ctxmsg)));
 }
 
 /*
@@ -713,61 +871,107 @@ pgreplicafdw_xact_callback(XactEvent event, void *arg)
 	{
 		int			i;
 
-		if (!rset->xact_open)
-			continue;
+		rset->active_scan = NULL;
 
-		for (i = 0; i < rset->nconns; i++)
+		if (rset->xact_open)
 		{
-			ReplicaConn *rconn = &rset->conns[i];
-			ListCell   *lc;
-
-			if (rconn->conn != NULL && rconn->state != REP_DEAD)
+			for (i = 0; i < rset->nconns; i++)
 			{
-				PGresult   *res;
+				ReplicaConn *rconn = &rset->conns[i];
+				ListCell   *lc;
 
-				switch (event)
+				if (rconn->conn != NULL && rconn->state != REP_DEAD)
 				{
-					case XACT_EVENT_PRE_COMMIT:
-						res = libpqsrv_exec(rconn->conn, "COMMIT", we_stream);
-						if (res == NULL || PQresultStatus(res) != PGRES_COMMAND_OK)
-							ereport(WARNING,
-									(errmsg("could not commit remote transaction on replica \"%s:%d\"",
-											rconn->host, rconn->port)));
-						if (res)
-							PQclear(res);
-						break;
+					PGresult   *res;
 
-					case XACT_EVENT_ABORT:
-						if (rconn->state == REP_STREAMING)
-							(void) libpqsrv_cancel(rconn->conn,
-												   TimestampTzPlusMilliseconds(GetCurrentTimestamp(), 5000));
-						res = libpqsrv_exec(rconn->conn, "ROLLBACK", we_stream);
-						if (res)
-							PQclear(res);
-						break;
+					switch (event)
+					{
+						case XACT_EVENT_PRE_COMMIT:
+							res = libpqsrv_exec(rconn->conn, "COMMIT", we_stream);
+							if (res == NULL || PQresultStatus(res) != PGRES_COMMAND_OK)
+								ereport(WARNING,
+										(errmsg("could not commit remote transaction on replica \"%s:%d\"",
+												rconn->host, rconn->port)));
+							if (res)
+								PQclear(res);
+							break;
 
-					default:
-						break;
+						case XACT_EVENT_ABORT:
+							if (rconn->state == REP_STREAMING)
+								(void) libpqsrv_cancel(rconn->conn,
+													   TimestampTzPlusMilliseconds(GetCurrentTimestamp(), 5000));
+							res = libpqsrv_exec(rconn->conn, "ROLLBACK", we_stream);
+							if (res)
+								PQclear(res);
+							break;
+
+						default:
+							break;
+					}
 				}
+
+				foreach(lc, rconn->rowqueue)
+					PQclear((PGresult *) lfirst(lc));
+				list_free(rconn->rowqueue);
+				rconn->rowqueue = NIL;
+				rconn->cur_row = 0;
+				rconn->paused = false;
+
+				if (rconn->conn != NULL && PQstatus(rconn->conn) != CONNECTION_OK)
+				{
+					libpqsrv_disconnect(rconn->conn);
+					rconn->conn = NULL;
+					rconn->state = REP_DISCONNECTED;
+				}
+				else if (rconn->state != REP_DEAD)
+					rconn->state = REP_IN_TXN;
 			}
 
-			foreach(lc, rconn->rowqueue)
-				PQclear((PGresult *) lfirst(lc));
-			list_free(rconn->rowqueue);
-			rconn->rowqueue = NIL;
-			rconn->cur_row = 0;
-			rconn->paused = false;
-
-			if (rconn->conn != NULL && PQstatus(rconn->conn) != CONNECTION_OK)
-			{
-				libpqsrv_disconnect(rconn->conn);
-				rconn->conn = NULL;
-				rconn->state = REP_DISCONNECTED;
-			}
-			else if (rconn->state != REP_DEAD)
-				rconn->state = REP_IN_TXN;
+			rset->xact_open = false;
 		}
 
-		rset->xact_open = false;
+		/*
+		 * An ALTER SERVER/ALTER USER MAPPING landed while this entry was
+		 * busy (rep_inval_callback couldn't safely rebuild it on the spot).
+		 * It's idle now -- tear it down so the next RepFdwGetConnections
+		 * rebuilds it with current options.
+		 */
+		if (rset->invalidated)
+		{
+			destroy_replicaset_conns(rset);
+			hash_search(ReplicaSetHash, &rset->umid, HASH_REMOVE, NULL);
+		}
+	}
+}
+
+/*
+ * rep_inval_callback
+ *		Syscache invalidation callback for pg_foreign_server and
+ *		pg_user_mapping: mark every cached ReplicaSet whose server or user
+ *		mapping just changed so it gets rebuilt (immediately if idle, or at
+ *		xact end if busy -- see RepFdwGetConnections/pgreplicafdw_xact_callback).
+ *		Registered on both FOREIGNSERVEROID and USERMAPPINGOID; hashvalue==0
+ *		means a full cache reset, in which case every entry is marked.
+ */
+static void
+rep_inval_callback(Datum arg, SysCacheIdentifier cacheid, uint32 hashvalue)
+{
+	HASH_SEQ_STATUS scan;
+	ReplicaSet *rset;
+
+	if (ReplicaSetHash == NULL)
+		return;
+
+	Assert(cacheid == FOREIGNSERVEROID || cacheid == USERMAPPINGOID);
+
+	hash_seq_init(&scan, ReplicaSetHash);
+	while ((rset = (ReplicaSet *) hash_seq_search(&scan)) != NULL)
+	{
+		if (hashvalue == 0 ||
+			(cacheid == FOREIGNSERVEROID &&
+			 rset->server_hashvalue == hashvalue) ||
+			(cacheid == USERMAPPINGOID &&
+			 rset->mapping_hashvalue == hashvalue))
+			rset->invalidated = true;
 	}
 }

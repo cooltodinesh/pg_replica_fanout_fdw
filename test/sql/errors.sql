@@ -1,8 +1,11 @@
 -- errors.sql: a server whose replicas include an unreachable host errors
 -- cleanly, names the offending replica, and respects connect_timeout
 -- instead of hanging.
-CREATE EXTENSION IF NOT EXISTS pg_replica_fanout_fdw;
+\i test/loopback-setup.sql
 
+-- Assumes 10.255.255.1:5999 is blackholed (times out) rather than actively
+-- refused on the CI/dev host; a host that rejects it immediately would
+-- produce a different message/timing and diff against the expected output.
 DROP SERVER IF EXISTS bad_loopback CASCADE;
 CREATE SERVER bad_loopback FOREIGN DATA WRAPPER pg_replica_fanout_fdw
   OPTIONS (replicas 'localhost:5432,10.255.255.1:5999', connect_timeout '2');
@@ -15,3 +18,12 @@ CREATE FOREIGN TABLE err_ft (id int)
   SERVER bad_loopback OPTIONS (table_name 'err_t');
 
 SELECT * FROM err_ft;
+
+-- a query-level remote error (missing relation) on an otherwise-healthy
+-- connection must not kill it: the next query on the same session must
+-- still succeed on the reused connection, not pay for a reconnect.
+CREATE FOREIGN TABLE missing_ft (id int)
+  SERVER loopback OPTIONS (table_name 'does_not_exist');
+
+SELECT * FROM missing_ft;
+SELECT count(*) FROM small_ft;
