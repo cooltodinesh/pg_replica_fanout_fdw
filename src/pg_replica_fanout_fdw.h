@@ -1,14 +1,14 @@
 /*-------------------------------------------------------------------------
  *
- * pg_replica_fdw.h
+ * pg_replica_fanout_fdw.h
  *		  Foreign-data wrapper that fans a sliced scan across N streaming
  *		  replicas and merges rows on the coordinator.  Read-only, no
  *		  remote qual/sort/aggregate pushdown.
  *
  *-------------------------------------------------------------------------
  */
-#ifndef PG_REPLICA_FDW_H
-#define PG_REPLICA_FDW_H
+#ifndef PG_REPLICA_FANOUT_FDW_H
+#define PG_REPLICA_FANOUT_FDW_H
 
 #include "foreign/foreign.h"
 #include "funcapi.h"
@@ -147,4 +147,4 @@ extern char *RepFdwBuildBoundedSql(const char *base_sql,
 extern TupleTableSlot *RepFdwNextTuple(RepFdwScanState *fsstate,
 										ForeignScanState *node);
 
-#endif							/* PG_REPLICA_FDW_H */
+#endif							/* PG_REPLICA_FANOUT_FDW_H */

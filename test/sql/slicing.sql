@@ -51,7 +51,7 @@ SELECT (SELECT count(*) FROM fewblocks_ft) = (SELECT count(*) FROM fewblocks_t) 
 
 -- 5. Single-replica server: pure passthrough, no slicing possible.
 DROP SERVER IF EXISTS loopback1 CASCADE;
-CREATE SERVER loopback1 FOREIGN DATA WRAPPER pg_replica_fdw
+CREATE SERVER loopback1 FOREIGN DATA WRAPPER pg_replica_fanout_fdw
   OPTIONS (replicas 'localhost:5432', consistency 'none');
 CREATE USER MAPPING FOR CURRENT_USER SERVER loopback1;
 

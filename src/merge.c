@@ -2,7 +2,7 @@
  *
  * merge.c
  *		  Raw round-robin merge and tuple materialization for
- *		  pg_replica_fdw.
+ *		  pg_replica_fanout_fdw.
  *
  *-------------------------------------------------------------------------
  */
@@ -12,7 +12,7 @@
 #include "executor/executor.h"
 #include "funcapi.h"
 
-#include "pg_replica_fdw.h"
+#include "pg_replica_fanout_fdw.h"
 
 /*
  * RepFdwNextTuple

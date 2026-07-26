@@ -14,13 +14,13 @@ EXCEPT
 SELECT * FROM small_t;
 
 -- validator: missing required "replicas" option
-CREATE SERVER v_missing_replicas FOREIGN DATA WRAPPER pg_replica_fdw
+CREATE SERVER v_missing_replicas FOREIGN DATA WRAPPER pg_replica_fanout_fdw
   OPTIONS (dbname 'postgres');
 
 -- validator: consistency 'lsn' rejected (only 'none' is supported)
-CREATE SERVER v_bad_consistency FOREIGN DATA WRAPPER pg_replica_fdw
+CREATE SERVER v_bad_consistency FOREIGN DATA WRAPPER pg_replica_fanout_fdw
   OPTIONS (replicas 'localhost', consistency 'lsn');
 
 -- validator: unknown option name
-CREATE SERVER v_bad_option FOREIGN DATA WRAPPER pg_replica_fdw
+CREATE SERVER v_bad_option FOREIGN DATA WRAPPER pg_replica_fanout_fdw
   OPTIONS (replicas 'localhost', bogus 'x');

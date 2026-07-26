@@ -1,7 +1,7 @@
 /*-------------------------------------------------------------------------
  *
  * deparse.c
- *		  Remote SQL template generation for pg_replica_fdw: a column list
+ *		  Remote SQL template generation for pg_replica_fanout_fdw: a column list
  *		  and the ctid-range WHERE clause for one replica's slice.  No
  *		  user-qual pushdown.
  *
@@ -13,7 +13,7 @@
 #include "utils/builtins.h"
 #include "utils/lsyscache.h"
 
-#include "pg_replica_fdw.h"
+#include "pg_replica_fanout_fdw.h"
 
 /*
  * RepFdwDeparseTemplate

@@ -1,4 +1,4 @@
-# pg_replica_fdw
+# pg_replica_fanout_fdw
 
 A PostgreSQL foreign-data wrapper that fans a **sliced table scan** across N
 streaming replicas and merges the rows on the coordinator, so that a large
@@ -7,7 +7,7 @@ table scan gets roughly 1/N the I/O per node instead of hitting one server.
 This is **Phase A**: the minimal fan-out substrate. It ships a raw,
 unordered scan only — no WHERE/aggregate pushdown, no ORDER BY/LIMIT
 merge, no LSN-aligned consistency. See `notes/phases.md` and
-`notes/pg_replica_fdw-plan.md` for the full roadmap; `notes/phase-a.md` is
+`notes/pg_replica_fanout_fdw-plan.md` for the full roadmap; `notes/phase-a.md` is
 this phase's implementation spec.
 
 Requires **PostgreSQL 19+** (uses `PQsetChunkedRowsMode`/
@@ -17,9 +17,9 @@ resource-owner form of `CreateWaitEventSet`).
 ## What it does
 
 ```sql
-CREATE EXTENSION pg_replica_fdw;
+CREATE EXTENSION pg_replica_fanout_fdw;
 
-CREATE SERVER my_replicas FOREIGN DATA WRAPPER pg_replica_fdw
+CREATE SERVER my_replicas FOREIGN DATA WRAPPER pg_replica_fanout_fdw
   OPTIONS (replicas 'replica1:5432,replica2:5432,replica3:5432');
 
 CREATE USER MAPPING FOR CURRENT_USER SERVER my_replicas;
@@ -45,7 +45,7 @@ contribute I/O too, just list it in `replicas` like any other node.
 | `consistency` | SERVER | `'none'` | only `'none'` is valid in Phase A |
 | `fetch_size` | SERVER/table | 1000 | rows per streamed chunk |
 | `connect_timeout` | SERVER | 5 (seconds) | |
-| `application_name` | SERVER | `pg_replica_fdw` | |
+| `application_name` | SERVER | `pg_replica_fanout_fdw` | |
 | `user`, `password` | USER MAPPING | *(none)* | one credential set for all replicas |
 | `table_name` | FOREIGN TABLE | the foreign table's own name | |
 | `schema_name` | FOREIGN TABLE | the foreign table's own schema | |
@@ -136,11 +136,11 @@ make installcheck PG_CONFIG=/path/to/pg_config
 
 ```
 Makefile                          PGXS build (MODULE_big, REGRESS)
-pg_replica_fdw.control
-sql/pg_replica_fdw--0.1.0.sql     handler()/validator() + CREATE FOREIGN DATA WRAPPER
+pg_replica_fanout_fdw.control
+sql/pg_replica_fanout_fdw--0.1.0.sql     handler()/validator() + CREATE FOREIGN DATA WRAPPER
 src/
-  pg_replica_fdw.h                shared structs/decls
-  pg_replica_fdw.c                handler + FDW plan/exec callbacks
+  pg_replica_fanout_fdw.h                shared structs/decls
+  pg_replica_fanout_fdw.c                handler + FDW plan/exec callbacks
   option.c                        validator, option parsing, replicas-list parser
   connection.c                    conn cache, concurrent connect, streaming loop, xact callbacks
   deparse.c                       SELECT template with ctid placeholder

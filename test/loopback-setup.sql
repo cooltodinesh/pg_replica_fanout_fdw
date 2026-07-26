@@ -7,9 +7,9 @@
 -- Idempotent by design (IF NOT EXISTS throughout, no DROP/CASCADE): this
 -- file is \i'd at the top of every suite, and suites run sequentially
 -- against the same regression database.
-CREATE EXTENSION IF NOT EXISTS pg_replica_fdw;
+CREATE EXTENSION IF NOT EXISTS pg_replica_fanout_fdw;
 
-CREATE SERVER IF NOT EXISTS loopback FOREIGN DATA WRAPPER pg_replica_fdw
+CREATE SERVER IF NOT EXISTS loopback FOREIGN DATA WRAPPER pg_replica_fanout_fdw
   OPTIONS (replicas 'localhost:5432,localhost:5432,localhost:5432',
            consistency 'none');
 

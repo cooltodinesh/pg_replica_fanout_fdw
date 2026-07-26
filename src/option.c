@@ -1,7 +1,7 @@
 /*-------------------------------------------------------------------------
  *
  * option.c
- *		  Validator and option parsing for pg_replica_fdw
+ *		  Validator and option parsing for pg_replica_fanout_fdw
  *
  *-------------------------------------------------------------------------
  */
@@ -21,9 +21,9 @@
 #include "utils/guc.h"
 #include "utils/lsyscache.h"
 
-#include "pg_replica_fdw.h"
+#include "pg_replica_fanout_fdw.h"
 
-PG_FUNCTION_INFO_V1(pg_replica_fdw_validator);
+PG_FUNCTION_INFO_V1(pg_replica_fanout_fdw_validator);
 
 typedef struct RepFdwValidOption
 {
@@ -87,7 +87,7 @@ parse_positive_int_option(DefElem *def)
 }
 
 Datum
-pg_replica_fdw_validator(PG_FUNCTION_ARGS)
+pg_replica_fanout_fdw_validator(PG_FUNCTION_ARGS)
 {
 	List	   *options_list = untransformRelOptions(PG_GETARG_DATUM(0));
 	Oid			catalog = PG_GETARG_OID(1);
@@ -152,7 +152,7 @@ pg_replica_fdw_validator(PG_FUNCTION_ARGS)
 	if (catalog == ForeignServerRelationId && !have_replicas)
 		ereport(ERROR,
 				(errcode(ERRCODE_FDW_OPTION_NAME_NOT_FOUND),
-				 errmsg("option \"replicas\" is required for a pg_replica_fdw server")));
+				 errmsg("option \"replicas\" is required for a pg_replica_fanout_fdw server")));
 
 	PG_RETURN_VOID();
 }
@@ -247,7 +247,7 @@ RepFdwGetOptions(Oid foreigntableid, RepFdwOptions **opts_out)
 
 	opts->fetch_size = 1000;
 	opts->connect_timeout = 5;
-	opts->application_name = "pg_replica_fdw";
+	opts->application_name = "pg_replica_fanout_fdw";
 	opts->min_blocks_per_slice = 128;
 
 	foreach(lc, server->options)

@@ -2,7 +2,7 @@
  *
  * connection.c
  *		  Connection cache, concurrent connect, streaming loop and remote
- *		  transaction management for pg_replica_fdw.
+ *		  transaction management for pg_replica_fanout_fdw.
  *
  *-------------------------------------------------------------------------
  */
@@ -20,7 +20,7 @@
 #include "utils/timestamp.h"
 #include "utils/wait_event.h"
 
-#include "pg_replica_fdw.h"
+#include "pg_replica_fanout_fdw.h"
 
 /* custom wait events, registered on first use */
 static uint32 we_connect = 0;
@@ -61,17 +61,17 @@ RepFdwGetConnections(UserMapping *user, RepFdwOptions *opts)
 		HASHCTL		ctl;
 
 		RepFdwCacheContext = AllocSetContextCreate(TopMemoryContext,
-													"pg_replica_fdw connection cache",
+													"pg_replica_fanout_fdw connection cache",
 													ALLOCSET_SMALL_SIZES);
 
 		if (we_connect == 0)
-			we_connect = WaitEventExtensionNew("PgReplicaFdwConnect");
+			we_connect = WaitEventExtensionNew("PgReplicaFanoutFdwConnect");
 		if (we_stream == 0)
-			we_stream = WaitEventExtensionNew("PgReplicaFdwStream");
+			we_stream = WaitEventExtensionNew("PgReplicaFanoutFdwStream");
 
 		ctl.keysize = sizeof(Oid);
 		ctl.entrysize = sizeof(ReplicaSet);
-		ReplicaSetHash = hash_create("pg_replica_fdw replica sets", 8, &ctl,
+		ReplicaSetHash = hash_create("pg_replica_fanout_fdw replica sets", 8, &ctl,
 									 HASH_ELEM | HASH_BLOBS);
 
 		RegisterXactCallback(pgreplicafdw_xact_callback, NULL);
@@ -160,13 +160,13 @@ start_connect(ReplicaConn *rconn, RepFdwOptions *opts, UserMapping *user)
 	}
 
 	keywords[n] = "fallback_application_name";
-	values[n++] = "pg_replica_fdw";
+	values[n++] = "pg_replica_fanout_fdw";
 	keywords[n] = NULL;
 	values[n] = NULL;
 
 	conn = libpqsrv_connect_params_start(keywords, values, false);
 	if (conn != NULL)
-		PQsetNoticeReceiver(conn, libpqsrv_notice_receiver, "pg_replica_fdw");
+		PQsetNoticeReceiver(conn, libpqsrv_notice_receiver, "pg_replica_fanout_fdw");
 
 	return conn;
 }

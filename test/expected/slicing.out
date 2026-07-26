@@ -9,9 +9,9 @@
 -- Idempotent by design (IF NOT EXISTS throughout, no DROP/CASCADE): this
 -- file is \i'd at the top of every suite, and suites run sequentially
 -- against the same regression database.
-CREATE EXTENSION IF NOT EXISTS pg_replica_fdw;
-psql:test/loopback-setup.sql:10: NOTICE:  extension "pg_replica_fdw" already exists, skipping
-CREATE SERVER IF NOT EXISTS loopback FOREIGN DATA WRAPPER pg_replica_fdw
+CREATE EXTENSION IF NOT EXISTS pg_replica_fanout_fdw;
+psql:test/loopback-setup.sql:10: NOTICE:  extension "pg_replica_fanout_fdw" already exists, skipping
+CREATE SERVER IF NOT EXISTS loopback FOREIGN DATA WRAPPER pg_replica_fanout_fdw
   OPTIONS (replicas 'localhost:5432,localhost:5432,localhost:5432',
            consistency 'none');
 psql:test/loopback-setup.sql:14: NOTICE:  server "loopback" already exists, skipping
@@ -104,7 +104,7 @@ SELECT (SELECT count(*) FROM fewblocks_ft) = (SELECT count(*) FROM fewblocks_t) 
 -- 5. Single-replica server: pure passthrough, no slicing possible.
 DROP SERVER IF EXISTS loopback1 CASCADE;
 NOTICE:  server "loopback1" does not exist, skipping
-CREATE SERVER loopback1 FOREIGN DATA WRAPPER pg_replica_fdw
+CREATE SERVER loopback1 FOREIGN DATA WRAPPER pg_replica_fanout_fdw
   OPTIONS (replicas 'localhost:5432', consistency 'none');
 CREATE USER MAPPING FOR CURRENT_USER SERVER loopback1;
 CREATE FOREIGN TABLE oneblock_ft1 (id int, val text)

@@ -1,7 +1,7 @@
 /*-------------------------------------------------------------------------
  *
  * slice.c
- *		  nblocks discovery and ctid block-range math for pg_replica_fdw.
+ *		  nblocks discovery and ctid block-range math for pg_replica_fanout_fdw.
  *
  *-------------------------------------------------------------------------
  */
@@ -10,7 +10,7 @@
 #include "lib/stringinfo.h"
 #include "utils/builtins.h"
 
-#include "pg_replica_fdw.h"
+#include "pg_replica_fanout_fdw.h"
 
 /*
  * RepFdwGetNBlocks

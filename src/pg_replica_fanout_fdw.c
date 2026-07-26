@@ -1,7 +1,7 @@
 /*-------------------------------------------------------------------------
  *
- * pg_replica_fdw.c
- *		  Handler and FDW callbacks (plan/exec glue) for pg_replica_fdw:
+ * pg_replica_fanout_fdw.c
+ *		  Handler and FDW callbacks (plan/exec glue) for pg_replica_fanout_fdw:
  *		  a sliced raw scan fanned out across N streaming replicas,
  *		  merged on the coordinator.  No remote qual pushdown, no ORDER
  *		  BY/aggregate pushdown, no writes.
@@ -30,14 +30,14 @@
 #include "utils/memutils.h"
 #include "utils/rel.h"
 
-#include "pg_replica_fdw.h"
+#include "pg_replica_fanout_fdw.h"
 
 PG_MODULE_MAGIC_EXT(
-					.name = "pg_replica_fdw",
+					.name = "pg_replica_fanout_fdw",
 					.version = PG_VERSION
 );
 
-PG_FUNCTION_INFO_V1(pg_replica_fdw_handler);
+PG_FUNCTION_INFO_V1(pg_replica_fanout_fdw_handler);
 
 static void repfdwGetForeignRelSize(PlannerInfo *root, RelOptInfo *baserel,
 									 Oid foreigntableid);
@@ -59,7 +59,7 @@ static bool repfdwIsForeignScanParallelSafe(PlannerInfo *root,
 											 RangeTblEntry *rte);
 
 Datum
-pg_replica_fdw_handler(PG_FUNCTION_ARGS)
+pg_replica_fanout_fdw_handler(PG_FUNCTION_ARGS)
 {
 	FdwRoutine *routine = makeNode(FdwRoutine);
 
@@ -265,10 +265,10 @@ repfdwBeginForeignScan(ForeignScanState *node, int eflags)
 	fsstate->attinmeta = TupleDescGetAttInMetadata(RelationGetDescr(rel));
 	fsstate->rr_cursor = 0;
 	fsstate->batch_cxt = AllocSetContextCreate(CurrentMemoryContext,
-											   "pg_replica_fdw batch",
+											   "pg_replica_fanout_fdw batch",
 											   ALLOCSET_DEFAULT_SIZES);
 	fsstate->row_cxt = AllocSetContextCreate(CurrentMemoryContext,
-											 "pg_replica_fdw row",
+											 "pg_replica_fanout_fdw row",
 											 ALLOCSET_SMALL_SIZES);
 
 	node->fdw_state = fsstate;

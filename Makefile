@@ -1,11 +1,11 @@
-# pg_replica_fdw/Makefile
+# pg_replica_fanout_fdw/Makefile
 
-MODULE_big = pg_replica_fdw
-OBJS = src/pg_replica_fdw.o src/option.o src/connection.o src/deparse.o \
+MODULE_big = pg_replica_fanout_fdw
+OBJS = src/pg_replica_fanout_fdw.o src/option.o src/connection.o src/deparse.o \
        src/slice.o src/merge.o
 
-EXTENSION = pg_replica_fdw
-DATA = sql/pg_replica_fdw--0.1.0.sql
+EXTENSION = pg_replica_fanout_fdw
+DATA = sql/pg_replica_fanout_fdw--0.1.0.sql
 
 REGRESS = basic slicing types_nulls errors
 REGRESS_OPTS = --inputdir=test --outputdir=test
