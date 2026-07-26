@@ -1,0 +1,8 @@
+*.o
+*.so
+*.bc
+test/results/
+test/regression.diffs
+test/regression.out
+test/tmp_check/
+test/log/

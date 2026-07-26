@@ -1,0 +1,17 @@
+-- errors.sql: a server whose replicas include an unreachable host errors
+-- cleanly, names the offending replica, and respects connect_timeout
+-- instead of hanging.
+CREATE EXTENSION IF NOT EXISTS pg_replica_fdw;
+
+DROP SERVER IF EXISTS bad_loopback CASCADE;
+CREATE SERVER bad_loopback FOREIGN DATA WRAPPER pg_replica_fdw
+  OPTIONS (replicas 'localhost:5432,10.255.255.1:5999', connect_timeout '2');
+CREATE USER MAPPING FOR CURRENT_USER SERVER bad_loopback;
+
+CREATE TABLE err_t (id int);
+INSERT INTO err_t SELECT generate_series(1, 5);
+
+CREATE FOREIGN TABLE err_ft (id int)
+  SERVER bad_loopback OPTIONS (table_name 'err_t');
+
+SELECT * FROM err_ft;

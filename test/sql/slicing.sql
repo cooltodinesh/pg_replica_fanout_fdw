@@ -1,0 +1,67 @@
+-- slicing.sql: the core correctness proof (machine-independent, no timing/BUFFERS)
+\i test/loopback-setup.sql
+
+-- 1. A table with many blocks: full row-set equality, count, checksum.
+CREATE TABLE big_t (id int, val text);
+INSERT INTO big_t SELECT g, repeat('x', 200) FROM generate_series(1, 100000) g;
+
+CREATE FOREIGN TABLE big_ft (id int, val text)
+  SERVER loopback OPTIONS (table_name 'big_t');
+
+-- disjoint slices must be lossless and duplicate-free in both directions
+SELECT count(*) FROM (SELECT * FROM big_ft EXCEPT SELECT * FROM big_t) x;
+SELECT count(*) FROM (SELECT * FROM big_t EXCEPT SELECT * FROM big_ft) x;
+
+SELECT (SELECT count(*) FROM big_ft) = (SELECT count(*) FROM big_t) AS counts_match;
+
+SELECT md5(string_agg(t::text, ',' ORDER BY id)) = (
+  SELECT md5(string_agg(t::text, ',' ORDER BY id)) FROM big_t t
+) AS checksums_match
+FROM big_ft t;
+
+-- 2. Empty table.
+CREATE TABLE empty_t (id int, val text);
+
+CREATE FOREIGN TABLE empty_ft (id int, val text)
+  SERVER loopback OPTIONS (table_name 'empty_t');
+
+SELECT count(*) FROM empty_ft;
+
+-- 3. Single-block table (fits comfortably in one page; P collapses to 1).
+CREATE TABLE oneblock_t (id int, val text);
+INSERT INTO oneblock_t SELECT g, 'v' || g FROM generate_series(1, 10) g;
+
+CREATE FOREIGN TABLE oneblock_ft (id int, val text)
+  SERVER loopback OPTIONS (table_name 'oneblock_t');
+
+SELECT count(*) FROM (SELECT * FROM oneblock_ft EXCEPT SELECT * FROM oneblock_t) x;
+SELECT count(*) FROM (SELECT * FROM oneblock_t EXCEPT SELECT * FROM oneblock_ft) x;
+
+-- 4. Fewer blocks than replicas: min_blocks_per_slice=1 forces a P-way
+--    split (P < 3) on a table sized to span a handful of blocks.
+CREATE TABLE fewblocks_t (id int, pad text);
+INSERT INTO fewblocks_t SELECT g, repeat('z', 900) FROM generate_series(1, 12) g;
+
+CREATE FOREIGN TABLE fewblocks_ft (id int, pad text)
+  SERVER loopback OPTIONS (table_name 'fewblocks_t', min_blocks_per_slice '1');
+
+SELECT count(*) FROM (SELECT * FROM fewblocks_ft EXCEPT SELECT * FROM fewblocks_t) x;
+SELECT count(*) FROM (SELECT * FROM fewblocks_t EXCEPT SELECT * FROM fewblocks_ft) x;
+SELECT (SELECT count(*) FROM fewblocks_ft) = (SELECT count(*) FROM fewblocks_t) AS counts_match;
+
+-- 5. Single-replica server: pure passthrough, no slicing possible.
+DROP SERVER IF EXISTS loopback1 CASCADE;
+CREATE SERVER loopback1 FOREIGN DATA WRAPPER pg_replica_fdw
+  OPTIONS (replicas 'localhost:5432', consistency 'none');
+CREATE USER MAPPING FOR CURRENT_USER SERVER loopback1;
+
+CREATE FOREIGN TABLE oneblock_ft1 (id int, val text)
+  SERVER loopback1 OPTIONS (table_name 'oneblock_t');
+
+SELECT count(*) FROM (SELECT * FROM oneblock_ft1 EXCEPT SELECT * FROM oneblock_t) x;
+SELECT count(*) FROM (SELECT * FROM oneblock_t EXCEPT SELECT * FROM oneblock_ft1) x;
+
+-- 6. Rescan: FDW table on the inner side of a correlated subquery must
+--    return correct results across many rescans of the same plan node.
+SELECT s.id, (SELECT val FROM oneblock_ft f WHERE f.id = s.id) AS val
+  FROM oneblock_t s ORDER BY s.id;

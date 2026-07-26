@@ -1,0 +1,66 @@
+-- types_nulls.sql: text-protocol materialization round-trips exactly,
+-- including interspersed NULLs, across the supported scalar types.
+\i test/loopback-setup.sql
+-- test/loopback-setup.sql
+--
+-- Shared setup for the loopback regress suites: point all three "replicas"
+-- at the same local instance.  Disjoint ctid slices still union to exactly
+-- the whole table, so slicing/fan-out/merge are fully exercised on one
+-- instance.  Idempotent, safe to \i at the top of any suite.
+-- Idempotent by design (IF NOT EXISTS throughout, no DROP/CASCADE): this
+-- file is \i'd at the top of every suite, and suites run sequentially
+-- against the same regression database.
+CREATE EXTENSION IF NOT EXISTS pg_replica_fdw;
+psql:test/loopback-setup.sql:10: NOTICE:  extension "pg_replica_fdw" already exists, skipping
+CREATE SERVER IF NOT EXISTS loopback FOREIGN DATA WRAPPER pg_replica_fdw
+  OPTIONS (replicas 'localhost:5432,localhost:5432,localhost:5432',
+           consistency 'none');
+psql:test/loopback-setup.sql:14: NOTICE:  server "loopback" already exists, skipping
+CREATE USER MAPPING IF NOT EXISTS FOR CURRENT_USER SERVER loopback;
+psql:test/loopback-setup.sql:16: NOTICE:  user mapping for "user" already exists for server "loopback", skipping
+CREATE TABLE types_t (
+  id          int4,
+  big         int8,
+  t           text,
+  num         numeric,
+  flag        bool,
+  ts          timestamptz
+);
+INSERT INTO types_t VALUES
+  (1, 10000000000, 'hello',   3.14159,  true,  '2024-01-01 00:00:00+00'),
+  (2, NULL,         NULL,     NULL,     NULL,  NULL),
+  (3, -5,           'world',  -2.5,     false, '2030-06-15 12:34:56+00'),
+  (4, 0,            '',       0,        true,  'epoch'),
+  (5, NULL,         'mixed',  NULL,     false, '1999-12-31 23:59:59+00'),
+  (NULL, 99,        'nullid', 1.5,      true,  '2024-01-01 00:00:00+00');
+CREATE FOREIGN TABLE types_ft (
+  id          int4,
+  big         int8,
+  t           text,
+  num         numeric,
+  flag        bool,
+  ts          timestamptz
+) SERVER loopback OPTIONS (table_name 'types_t', min_blocks_per_slice '1');
+SELECT count(*) FROM (SELECT * FROM types_ft EXCEPT SELECT * FROM types_t) x;
+ count 
+-------
+     0
+(1 row)
+
+SELECT count(*) FROM (SELECT * FROM types_t EXCEPT SELECT * FROM types_ft) x;
+ count 
+-------
+     0
+(1 row)
+
+SELECT * FROM types_ft ORDER BY id NULLS LAST, big NULLS LAST;
+ id |     big     |   t    |   num   | flag |              ts              
+----+-------------+--------+---------+------+------------------------------
+  1 | 10000000000 | hello  | 3.14159 | t    | Sun Dec 31 16:00:00 2023 PST
+  2 |             |        |         |      | 
+  3 |          -5 | world  |    -2.5 | f    | Sat Jun 15 05:34:56 2030 PDT
+  4 |           0 |        |       0 | t    | Wed Dec 31 16:00:00 1969 PST
+  5 |             | mixed  |         | f    | Fri Dec 31 15:59:59 1999 PST
+    |          99 | nullid |     1.5 | t    | Sun Dec 31 16:00:00 2023 PST
+(6 rows)
+
