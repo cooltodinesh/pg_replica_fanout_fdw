@@ -75,6 +75,19 @@ RepFdwDeparseTemplate(Oid foreigntableid, List *retrieved_attrs,
 }
 
 /*
+ * RepFdwDeparseCountTemplate
+ *		Build "SELECT count(*) FROM <schema>.<table>" for the count(*)
+ *		pushdown plan shape -- no columns, no WHERE yet (RepFdwBuildBoundedSql
+ *		appends the per-slice ctid bound, same as for a plain scan).
+ */
+char *
+RepFdwDeparseCountTemplate(const char *schema, const char *table)
+{
+	return psprintf("SELECT count(*) FROM %s",
+					quote_qualified_identifier(schema, table));
+}
+
+/*
  * RepFdwBuildBoundedSql
  *		Append the ctid-range WHERE clause for one replica's slice to a
  *		deparsed template, using $1/$2 bind-parameter placeholders for

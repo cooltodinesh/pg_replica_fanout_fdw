@@ -26,6 +26,7 @@
 #include "optimizer/pathnode.h"
 #include "optimizer/planmain.h"
 #include "optimizer/restrictinfo.h"
+#include "optimizer/tlist.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "utils/rel.h"
@@ -57,6 +58,11 @@ static void repfdwExplainForeignScan(ForeignScanState *node, ExplainState *es);
 static bool repfdwIsForeignScanParallelSafe(PlannerInfo *root,
 											 RelOptInfo *rel,
 											 RangeTblEntry *rte);
+static void repfdwGetForeignUpperPaths(PlannerInfo *root,
+										UpperRelationKind stage,
+										RelOptInfo *input_rel,
+										RelOptInfo *output_rel,
+										void *extra);
 
 Datum
 pg_replica_fanout_fdw_handler(PG_FUNCTION_ARGS)
@@ -72,6 +78,7 @@ pg_replica_fanout_fdw_handler(PG_FUNCTION_ARGS)
 	routine->EndForeignScan = repfdwEndForeignScan;
 	routine->ExplainForeignScan = repfdwExplainForeignScan;
 	routine->IsForeignScanParallelSafe = repfdwIsForeignScanParallelSafe;
+	routine->GetForeignUpperPaths = repfdwGetForeignUpperPaths;
 
 	PG_RETURN_POINTER(routine);
 }
@@ -152,6 +159,130 @@ repfdwGetForeignPaths(PlannerInfo *root, RelOptInfo *baserel,
 }
 
 /*
+ * repfdwGetForeignUpperPaths
+ *		Claim UPPERREL_GROUP_AGG for a single, narrow shape: unqualified
+ *		count(*) over one of our foreign baserels, no WHERE/GROUP
+ *		BY/HAVING/DISTINCT.  Each replica will compute its own partial count
+ *		over its ctid slice and the coordinator sums them -- see
+ *		RepFdwNextCountTuple in merge.c -- so there is no Agg node above the
+ *		Foreign Scan in the finished plan.
+ *
+ *		Anything not recognized here must fall back to a normal scan plus a
+ *		local Agg: we bail out (add no path) rather than risk a wrong
+ *		answer.
+ */
+static void
+repfdwGetForeignUpperPaths(PlannerInfo *root, UpperRelationKind stage,
+						   RelOptInfo *input_rel, RelOptInfo *output_rel,
+						   void *extra)
+{
+	RepFdwPlanState *ifpinfo;
+	RepFdwPlanState *fpinfo;
+	PathTarget *grouping_target;
+	Aggref	   *aggref;
+	Cost		startup_cost;
+	Cost		total_cost;
+	ForeignPath *path;
+
+	/* 1. Only the plain full-aggregation upper stage; ignore the rest. */
+	if (stage != UPPERREL_GROUP_AGG)
+		return;
+
+	/* 2. Don't add a second path if something already claimed this rel. */
+	if (output_rel->fdw_private != NULL)
+		return;
+
+	/*
+	 * 3. input_rel must be one of our own foreign baserels, and only one --
+	 * no joins.  (GetForeignUpperPaths is only invoked at all when
+	 * output_rel->fdwroutine, inherited from input_rel->fdwroutine, is
+	 * ours, but that alone doesn't rule out a join of several of our
+	 * tables.)
+	 */
+	if (input_rel->reloptkind != RELOPT_BASEREL ||
+		input_rel->fdw_private == NULL ||
+		bms_membership(input_rel->relids) != BMS_SINGLETON)
+		return;
+
+	ifpinfo = (RepFdwPlanState *) input_rel->fdw_private;
+
+	/* 4. No GROUP BY / grouping sets. */
+	if (root->parse->groupClause != NIL || root->parse->groupingSets != NIL)
+		return;
+
+	/* 5. No HAVING. */
+	if (root->parse->havingQual != NULL)
+		return;
+
+	/*
+	 * 6. No local qual on the base rel -- we never push quals, so any
+	 * WHERE means the remote count(*) would answer a different question.
+	 */
+	if (input_rel->baserestrictinfo != NIL)
+		return;
+
+	/*
+	 * 7. The grouping target must be exactly one expression, and it must
+	 * be a bare count(*): aggstar, no DISTINCT/ORDER BY/FILTER, simple
+	 * (non-partial) aggregation.  The core planner has already set
+	 * output_rel->reltarget to the query's grouping target by the time it
+	 * calls us (see create_grouping_paths/make_grouping_rel).
+	 */
+	grouping_target = output_rel->reltarget;
+	if (list_length(grouping_target->exprs) != 1)
+		return;
+
+	if (!IsA(linitial(grouping_target->exprs), Aggref))
+		return;
+
+	aggref = castNode(Aggref, linitial(grouping_target->exprs));
+	if (!aggref->aggstar ||
+		aggref->aggdistinct != NIL ||
+		aggref->aggorder != NIL ||
+		aggref->aggfilter != NULL ||
+		aggref->aggsplit != AGGSPLIT_SIMPLE)
+		return;
+
+	/* Eligible: stash the plan-time marker and add the foreign path. */
+	fpinfo = palloc0_object(RepFdwPlanState);
+	fpinfo->opts = ifpinfo->opts;
+	fpinfo->foreigntableid = ifpinfo->foreigntableid;
+	fpinfo->is_count_agg = true;
+	output_rel->fdw_private = fpinfo;
+
+	/*
+	 * Cost must reliably beat "scan + local Agg", but that fallback isn't
+	 * necessarily expensive: a foreign table with no ANALYZE stats gets a
+	 * default rows estimate of 1 (see repfdwGetForeignPaths), so the local
+	 * fallback's own cost is already close to the minimum cost the planner
+	 * can express (e.g. a 0.00..0.01 scan feeding a 0.01..0.02 Agg) -- a
+	 * flat per-replica constant like cpu_tuple_cost * nreplicas can easily
+	 * come out *higher* than that and lose the comparison outright. Since
+	 * we can't estimate the real remote cost any better without a
+	 * planning-time round trip (out of scope here, same as
+	 * repfdwGetForeignPaths), just cost this at zero: we are certain it
+	 * does less work than shipping every row back and aggregating locally,
+	 * so always preferring it is correct, not just a tie-break.
+	 */
+	startup_cost = 0;
+	total_cost = 0;
+
+	path = create_foreign_upper_path(root, output_rel,
+									 grouping_target,
+									 1,		/* rows: exactly one output row */
+									 0,		/* disabled_nodes */
+									 startup_cost,
+									 total_cost,
+									 NIL,	/* no pathkeys */
+									 NULL,	/* no fdw_outerpath */
+									 NIL,	/* no fdw_restrictinfo */
+									 NIL);	/* fdw_private carried on
+											 * output_rel instead */
+
+	add_path(output_rel, (Path *) path);
+}
+
+/*
  * repfdwGetForeignPlan
  *		Compute retrieved_attrs from the plan-time attrs_used bitmap and
  *		deparse the ctid-templated remote SELECT.  All scan_clauses are
@@ -168,6 +299,36 @@ repfdwGetForeignPlan(PlannerInfo *root, RelOptInfo *baserel,
 	int			attno = -1;
 	char	   *sql_template;
 	List	   *fdw_private;
+
+	/*
+	 * The count(*) pushdown plan shape: an upper (GROUP_AGG) rel with
+	 * relid==0, no columns to fetch, and a fixed remote template.  fdw_scan_tlist
+	 * carries the single emitted int8 count column (setrefs.c later folds
+	 * the query's Aggref into a Var referencing it, since scan_relid==0 --
+	 * see notes/phase-b-count.md).  is_count_agg/foreigntableid are also
+	 * duplicated into fdw_private because scan_relid==0 means
+	 * BeginForeignScan/ExplainForeignScan can't get them from
+	 * ss_currentRelation, which will be NULL.
+	 */
+	if (fpinfo->is_count_agg)
+	{
+		char	   *count_sql = RepFdwDeparseCountTemplate(fpinfo->opts->schema_name,
+														   fpinfo->opts->table_name);
+		List	   *fdw_scan_tlist = make_tlist_from_pathtarget(baserel->reltarget);
+		List	   *count_fdw_private = list_make4(makeString(count_sql),
+												   NIL,
+												   makeBoolean(true),
+												   makeInteger(fpinfo->foreigntableid));
+
+		return make_foreignscan(tlist,
+								NIL,	/* no local exprs */
+								0,		/* scan_relid */
+								NIL,	/* no fdw_exprs */
+								count_fdw_private,
+								fdw_scan_tlist,
+								NIL,	/* no recheck quals */
+								NULL);	/* no outer plan */
+	}
 
 	scan_clauses = extract_actual_clauses(scan_clauses, false);
 
@@ -229,9 +390,9 @@ static void
 repfdwBeginForeignScan(ForeignScanState *node, int eflags)
 {
 	ForeignScan *fsplan = (ForeignScan *) node->ss.ps.plan;
-	Relation	rel = node->ss.ss_currentRelation;
-	Oid			foreigntableid = RelationGetRelid(rel);
 	List	   *fdw_private = fsplan->fdw_private;
+	bool		is_count_agg;
+	Oid			foreigntableid;
 	RepFdwScanState *fsstate;
 	RepFdwOptions *opts;
 	ForeignServer *server;
@@ -241,6 +402,23 @@ repfdwBeginForeignScan(ForeignScanState *node, int eflags)
 
 	if (eflags & EXEC_FLAG_EXPLAIN_ONLY)
 		return;
+
+	/*
+	 * scan_relid==0 (the count(*) pushdown plan shape) means
+	 * ss_currentRelation is NULL -- fdw_private carries is_count_agg and
+	 * foreigntableid for exactly this reason.  A plain scan's 2-element
+	 * fdw_private has neither, so fall back to the relation.
+	 */
+	if (list_length(fdw_private) >= 4)
+	{
+		is_count_agg = boolVal(lthird(fdw_private));
+		foreigntableid = (Oid) intVal(lfourth(fdw_private));
+	}
+	else
+	{
+		is_count_agg = false;
+		foreigntableid = RelationGetRelid(node->ss.ss_currentRelation);
+	}
 
 	RepFdwGetOptions(foreigntableid, &opts);
 	server = GetForeignServer(GetForeignTable(foreigntableid)->serverid);
@@ -252,6 +430,7 @@ repfdwBeginForeignScan(ForeignScanState *node, int eflags)
 	fsstate->sql_template = strVal(linitial(fdw_private));
 	fsstate->retrieved_attrs = (List *) lsecond(fdw_private);
 	fsstate->fetch_size = opts->fetch_size;
+	fsstate->is_count_agg = is_count_agg;
 
 	fsstate->rset = RepFdwGetConnections(user, opts);
 
@@ -283,7 +462,13 @@ repfdwBeginForeignScan(ForeignScanState *node, int eflags)
 	RepFdwStartQueries(fsstate->rset, fsstate->nslices, fsstate->replica_sqls,
 					   fsstate->replica_bounds, fsstate->fetch_size);
 
-	fsstate->attinmeta = TupleDescGetAttInMetadata(RelationGetDescr(rel));
+	/*
+	 * The count(*) merge path (RepFdwNextCountTuple) parses one int8 cell
+	 * directly and never needs attinmeta; only the plain-scan merge path
+	 * (RepFdwNextTuple) does.
+	 */
+	fsstate->attinmeta = is_count_agg ? NULL :
+		TupleDescGetAttInMetadata(RelationGetDescr(node->ss.ss_currentRelation));
 	fsstate->rr_cursor = 0;
 	fsstate->batch_cxt = AllocSetContextCreate(CurrentMemoryContext,
 											   "pg_replica_fanout_fdw batch",
@@ -299,6 +484,9 @@ static TupleTableSlot *
 repfdwIterateForeignScan(ForeignScanState *node)
 {
 	RepFdwScanState *fsstate = (RepFdwScanState *) node->fdw_state;
+
+	if (fsstate->is_count_agg)
+		return RepFdwNextCountTuple(fsstate, node);
 
 	return RepFdwNextTuple(fsstate, node);
 }
@@ -330,6 +518,14 @@ repfdwReScanForeignScan(ForeignScanState *node)
 	RepFdwStartQueries(fsstate->rset, fsstate->nslices, fsstate->replica_sqls,
 					   fsstate->replica_bounds, fsstate->fetch_size);
 	fsstate->rr_cursor = 0;
+
+	/*
+	 * The count(*) combine path emits exactly one row and then latches eof;
+	 * a rescan (e.g. this scan on the inner side of a nestloop) must clear it
+	 * so the resent queries produce the count again.  The plain-scan path does
+	 * not read eof, so this is harmless there.
+	 */
+	fsstate->eof = false;
 }
 
 /*
@@ -369,7 +565,8 @@ static void
 repfdwExplainForeignScan(ForeignScanState *node, ExplainState *es)
 {
 	ForeignScan *fsplan = (ForeignScan *) node->ss.ps.plan;
-	char	   *sql_template = strVal(linitial(fsplan->fdw_private));
+	List	   *fdw_private = fsplan->fdw_private;
+	char	   *sql_template = strVal(linitial(fdw_private));
 	RepFdwScanState *fsstate = (RepFdwScanState *) node->fdw_state;
 	int			nreplicas;
 
@@ -378,8 +575,20 @@ repfdwExplainForeignScan(ForeignScanState *node, ExplainState *es)
 	else
 	{
 		RepFdwOptions *opts;
+		Oid			foreigntableid;
 
-		RepFdwGetOptions(RelationGetRelid(node->ss.ss_currentRelation), &opts);
+		/*
+		 * EXPLAIN-only (no execution): scan_relid==0 means
+		 * ss_currentRelation is NULL for the count(*) pushdown shape, so
+		 * get foreigntableid from fdw_private instead, same as
+		 * BeginForeignScan.
+		 */
+		if (list_length(fdw_private) >= 4)
+			foreigntableid = (Oid) intVal(lfourth(fdw_private));
+		else
+			foreigntableid = RelationGetRelid(node->ss.ss_currentRelation);
+
+		RepFdwGetOptions(foreigntableid, &opts);
 		nreplicas = list_length(opts->replicas);
 	}
 

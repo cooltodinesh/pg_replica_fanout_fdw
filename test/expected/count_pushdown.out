@@ -1,0 +1,196 @@
+-- count_pushdown.sql: unqualified count(*) is pushed down as an internal
+-- combine -- each replica computes its own partial count over its ctid
+-- slice, and the FDW itself SUMs the partials into a single emitted row.
+-- There is no Agg node above the Foreign Scan in the finished plan.
+--
+-- Checks below are deliberately *discriminating*:
+--   * A regressed combine that emitted one row per replica (instead of
+--     summing) would show "actual rows=3", not 1.
+--   * A stale/1-slice connection cache would show "Replicas: 1", not 3.
+--   * Every negative-guard query below is NOT an unqualified count(*), so
+--     none of them may be pushed down; each must fall back to a correct
+--     local Aggregate over a plain (uncombined) Foreign Scan.
+\i test/loopback-setup.sql
+-- test/loopback-setup.sql
+--
+-- Shared setup for the loopback regress suites: point all three "replicas"
+-- at the same local instance.  Disjoint ctid slices still union to exactly
+-- the whole table, so slicing/fan-out/merge are fully exercised on one
+-- instance.  Idempotent, safe to \i at the top of any suite.
+-- Idempotent by design (IF NOT EXISTS throughout, no DROP/CASCADE): this
+-- file is \i'd at the top of every suite, and suites run sequentially
+-- against the same regression database.
+CREATE EXTENSION IF NOT EXISTS pg_replica_fanout_fdw;
+psql:test/loopback-setup.sql:10: NOTICE:  extension "pg_replica_fanout_fdw" already exists, skipping
+CREATE SERVER IF NOT EXISTS loopback FOREIGN DATA WRAPPER pg_replica_fanout_fdw
+  OPTIONS (replicas 'localhost:5432,localhost:5432,localhost:5432',
+           consistency 'none');
+psql:test/loopback-setup.sql:14: NOTICE:  server "loopback" already exists, skipping
+CREATE USER MAPPING IF NOT EXISTS FOR CURRENT_USER SERVER loopback;
+psql:test/loopback-setup.sql:16: NOTICE:  user mapping for "user" already exists for server "loopback", skipping
+-- Multi-block table so that, with min_blocks_per_slice=1, nslices tracks
+-- nconns (P = Min(nconns, nblocks) and nblocks >> 3 here) -- same sizing as
+-- test/sql/invalidation.sql's inv_t.
+CREATE TABLE count_t (id int, pad text);
+INSERT INTO count_t SELECT g, repeat('q', 900) FROM generate_series(1, 400) g;
+DROP SERVER IF EXISTS count_srv CASCADE;
+NOTICE:  server "count_srv" does not exist, skipping
+CREATE SERVER count_srv FOREIGN DATA WRAPPER pg_replica_fanout_fdw
+  OPTIONS (replicas 'localhost:5432,localhost:5432,localhost:5432',
+           consistency 'none');
+CREATE USER MAPPING FOR CURRENT_USER SERVER count_srv;
+CREATE FOREIGN TABLE cft (id int, pad text)
+  SERVER count_srv OPTIONS (table_name 'count_t', min_blocks_per_slice '1');
+-- 1. Pushdown happens, and the answer is correct.
+SELECT count(*) FROM cft;
+ count 
+-------
+   400
+(1 row)
+
+-- No Aggregate/Partial Aggregate node above the Foreign Scan, and the
+-- deparsed remote template is the count(*) shape.
+EXPLAIN (COSTS OFF) SELECT count(*) FROM cft;
+                         QUERY PLAN                         
+------------------------------------------------------------
+ Foreign Scan
+   Replicas: 3
+   Remote SQL Template: SELECT count(*) FROM public.count_t
+(3 rows)
+
+-- 2. Slices actually ran: Replicas: 3 (not a stale 1-slice cache), and
+-- exactly one row came back (not one row per replica -- that would be a
+-- broken combine).  Also an independent re-proof that the 3 slices are
+-- disjoint and complete: SUM of partials = true row count.
+EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF)
+  SELECT count(*) FROM cft;
+                         QUERY PLAN                         
+------------------------------------------------------------
+ Foreign Scan (actual rows=1.00 loops=1)
+   Replicas: 3
+   Remote SQL Template: SELECT count(*) FROM public.count_t
+(3 rows)
+
+-- 3. Negative guards -- pushdown must NOT trigger; local Agg must still
+-- compute the correct answer.
+-- count(DISTINCT id): aggdistinct != NIL (also aggstar is false here)
+EXPLAIN (COSTS OFF) SELECT count(DISTINCT id) FROM cft;
+                            QUERY PLAN                            
+------------------------------------------------------------------
+ Aggregate
+   ->  Sort
+         Sort Key: id
+         ->  Foreign Scan on cft
+               Replicas: 3
+               Remote SQL Template: SELECT id FROM public.count_t
+(6 rows)
+
+SELECT count(DISTINCT id) FROM cft;
+ count 
+-------
+   400
+(1 row)
+
+-- a WHERE clause: baserestrictinfo != NIL
+EXPLAIN (COSTS OFF) SELECT count(*) FROM cft WHERE id > 100;
+                         QUERY PLAN                         
+------------------------------------------------------------
+ Aggregate
+   ->  Foreign Scan on cft
+         Filter: (id > 100)
+         Replicas: 3
+         Remote SQL Template: SELECT id FROM public.count_t
+(5 rows)
+
+SELECT count(*) FROM cft WHERE id > 100;
+ count 
+-------
+   300
+(1 row)
+
+-- GROUP BY: groupClause != NIL
+EXPLAIN (COSTS OFF) SELECT id, count(*) FROM cft GROUP BY id;
+                         QUERY PLAN                         
+------------------------------------------------------------
+ HashAggregate
+   Group Key: id
+   ->  Foreign Scan on cft
+         Replicas: 3
+         Remote SQL Template: SELECT id FROM public.count_t
+(5 rows)
+
+SELECT count(*) FROM (SELECT id, count(*) FROM cft GROUP BY id) s;
+ count 
+-------
+   400
+(1 row)
+
+-- sum(), not count(*): aggstar is false
+EXPLAIN (COSTS OFF) SELECT sum(id) FROM cft;
+                         QUERY PLAN                         
+------------------------------------------------------------
+ Aggregate
+   ->  Foreign Scan on cft
+         Replicas: 3
+         Remote SQL Template: SELECT id FROM public.count_t
+(4 rows)
+
+SELECT sum(id) FROM cft;
+  sum  
+-------
+ 80200
+(1 row)
+
+-- HAVING: havingQual != NULL
+EXPLAIN (COSTS OFF) SELECT count(*) FROM cft HAVING count(*) > 0;
+                          QUERY PLAN                          
+--------------------------------------------------------------
+ Aggregate
+   Filter: (count(*) > 0)
+   ->  Foreign Scan on cft
+         Replicas: 3
+         Remote SQL Template: SELECT NULL FROM public.count_t
+(5 rows)
+
+SELECT count(*) FROM cft HAVING count(*) > 0;
+ count 
+-------
+   400
+(1 row)
+
+-- 4. Reuse: a pushed count(*) followed by a plain scan in the same session
+-- must both succeed -- the connection cache / active_scan guard has to
+-- cycle correctly across the two plan shapes (scan_relid==0 vs. the normal
+-- per-baserel scan).
+SELECT count(*) FROM cft;
+ count 
+-------
+   400
+(1 row)
+
+SELECT id FROM cft ORDER BY id LIMIT 3;
+ id 
+----
+  1
+  2
+  3
+(3 rows)
+
+-- 5. Rescan: the pushed-down count(*) on the inner side of a nestloop is
+-- re-executed once per outer row.  The combine latches eof after emitting
+-- its single row, so ReScan must clear it -- otherwise the 2nd and 3rd
+-- rescans return no row and outer rows silently drop.  enable_material=off
+-- keeps the planner from caching the inner (which would mask the bug).
+SET enable_material = off;
+SELECT v.x, c.n
+  FROM (VALUES (1), (2), (3)) v(x)
+  CROSS JOIN LATERAL (SELECT count(*) AS n FROM cft) c
+  ORDER BY v.x;
+ x |  n  
+---+-----
+ 1 | 400
+ 2 | 400
+ 3 | 400
+(3 rows)
+
+RESET enable_material;

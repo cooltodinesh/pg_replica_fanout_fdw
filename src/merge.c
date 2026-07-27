@@ -11,6 +11,7 @@
 #include "access/htup_details.h"
 #include "executor/executor.h"
 #include "funcapi.h"
+#include "utils/builtins.h"
 
 #include "pg_replica_fanout_fdw.h"
 
@@ -106,4 +107,84 @@ RepFdwNextTuple(RepFdwScanState *fsstate, ForeignScanState *node)
 			MemoryContextSwitchTo(oldcxt);
 		}
 	}
+}
+
+/*
+ * RepFdwNextCountTuple
+ *		Combine step for the count(*) pushdown plan shape (see
+ *		notes/phase-b-count.md).  Pumps every replica to REP_DONE, sums the
+ *		single int8 partial count each one returns for its ctid slice, and
+ *		emits exactly one row.  There is no per-replica interleaving to do
+ *		here (unlike RepFdwNextTuple) since nothing is returned until every
+ *		replica has finished.
+ */
+TupleTableSlot *
+RepFdwNextCountTuple(RepFdwScanState *fsstate, ForeignScanState *node)
+{
+	TupleTableSlot *slot = node->ss.ss_ScanTupleSlot;
+	int			nslices = fsstate->nslices;
+	int64		total = 0;
+	int			i;
+
+	if (fsstate->eof)
+	{
+		ExecClearTuple(slot);
+		return slot;
+	}
+
+	for (;;)
+	{
+		bool		all_done = true;
+
+		for (i = 0; i < nslices; i++)
+		{
+			if (fsstate->rset->conns[i].state != REP_DONE)
+			{
+				all_done = false;
+				break;
+			}
+		}
+
+		if (all_done)
+			break;
+
+		{
+			MemoryContext oldcxt = MemoryContextSwitchTo(fsstate->batch_cxt);
+
+			RepStreamPump(fsstate);
+			MemoryContextSwitchTo(oldcxt);
+		}
+	}
+
+	for (i = 0; i < nslices; i++)
+	{
+		ReplicaConn *rconn = &fsstate->rset->conns[i];
+		PGresult   *res;
+
+		if (rconn->rowqueue == NIL)
+			elog(ERROR,
+				 "pg_replica_fanout_fdw: replica \"%s:%d\" returned no result for pushed-down count(*)",
+				 rconn->host, rconn->port);
+
+		res = (PGresult *) linitial(rconn->rowqueue);
+
+		if (PQntuples(res) != 1 || PQgetisnull(res, 0, 0))
+			elog(ERROR,
+				 "pg_replica_fanout_fdw: replica \"%s:%d\" returned an unexpected result for pushed-down count(*)",
+				 rconn->host, rconn->port);
+
+		total += pg_strtoint64(PQgetvalue(res, 0, 0));
+
+		PQclear(res);
+		rconn->rowqueue = list_delete_first(rconn->rowqueue);
+		rconn->cur_row = 0;
+	}
+
+	ExecClearTuple(slot);
+	slot->tts_values[0] = Int64GetDatum(total);
+	slot->tts_isnull[0] = false;
+	ExecStoreVirtualTuple(slot);
+
+	fsstate->eof = true;
+	return slot;
 }

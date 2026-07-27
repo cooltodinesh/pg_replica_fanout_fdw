@@ -4,11 +4,10 @@ A PostgreSQL foreign-data wrapper that fans a **sliced table scan** across N
 streaming replicas and merges the rows on the coordinator, so that a large
 table scan gets roughly 1/N the I/O per node instead of hitting one server.
 
-This is **Phase A**: the minimal fan-out substrate. It ships a raw,
-unordered scan only — no WHERE/aggregate pushdown, no ORDER BY/LIMIT
-merge, no LSN-aligned consistency. See `notes/phases.md` and
-`notes/pg_replica_fanout_fdw-plan.md` for the full roadmap; `notes/phase-a.md` is
-this phase's implementation spec.
+It supports a raw fan-out scan plus pushdown of unqualified `count(*)`
+(see "Aggregate pushdown" below); everything else (WHERE, ORDER BY,
+LIMIT, and every other aggregate) is still evaluated locally on the
+coordinator.
 
 Requires **PostgreSQL 19+** (uses `PQsetChunkedRowsMode`/
 `PGRES_TUPLES_CHUNK`, the `libpqsrv_*` connection helpers, and the
@@ -42,7 +41,7 @@ contribute I/O too, just list it in `replicas` like any other node.
 |---|---|---|---|
 | `replicas` | SERVER | *(required)* | `'host1[:port],host2,...'`; order = replica/slice index |
 | `dbname` | SERVER | coordinator's current database | standbys share the primary's catalogs |
-| `consistency` | SERVER | `'none'` | only `'none'` is valid in Phase A |
+| `consistency` | SERVER | `'none'` | only `'none'` is currently supported |
 | `fetch_size` | SERVER/table | 1000 | rows per streamed chunk |
 | `connect_timeout` | SERVER | 5 (seconds) | |
 | `application_name` | SERVER | `pg_replica_fanout_fdw` | |
@@ -52,14 +51,23 @@ contribute I/O too, just list it in `replicas` like any other node.
 | `min_blocks_per_slice` | FOREIGN TABLE | 128 | anti-over-slicing guard; lower it (e.g. `1`) to force multi-way splits in tests on small tables |
 | `column_name` | COLUMN | the column's own name | remote column name, if it differs from the local one |
 
-## Known limitations (Phase A)
+## Aggregate pushdown
+
+- **`count(*)` is pushed down.** An unqualified `SELECT count(*) FROM
+  big_ft` (no `WHERE`, `GROUP BY`, `HAVING`, or `DISTINCT`) is answered by
+  having each replica compute `count(*)` over its own ctid slice and
+  summing the partials on the coordinator — only N small integers cross
+  the network, not every row. `EXPLAIN` shows a single `Foreign Scan`
+  with no `Aggregate` node above it. Anything else (`count(DISTINCT
+  ...)`, a `WHERE` clause, `GROUP BY`, `sum`/`avg`/`min`/`max`, `HAVING`)
+  falls back to fetching every row and aggregating locally.
+
+## Known limitations
 
 - **Read-only.** No INSERT/UPDATE/DELETE, no join pushdown.
-- **No pushdown at all.** WHERE clauses, `ORDER BY`, `LIMIT`, and
-  aggregates are always evaluated locally on the coordinator after every
-  row has been shipped back. This means `SELECT count(*) FROM big_ft` is
-  a good way to exercise the scan-side I/O split, but does **not** reduce
-  network traffic — that's Phase B (aggregate pushdown).
+- **No pushdown beyond unqualified `count(*)`.** WHERE clauses, `ORDER
+  BY`, `LIMIT`, and every other aggregate are always evaluated locally on
+  the coordinator after every row has been shipped back.
 - **`consistency='none'` only.** No LSN alignment; each replica reads
   under its own `REPEATABLE READ` snapshot with no cross-replica skew
   bound. Any connect or scan failure is a plain `ERROR` — there is no
@@ -81,17 +89,15 @@ contribute I/O too, just list it in `replicas` like any other node.
   the FDW on both sides of a merge join, will error rather than corrupt
   results. A nested-loop **rescan** of the same scan node is fine — it
   re-runs the inner scan sequentially. Lifting this needs per-scan
-  cursors or per-replica connection pooling, not yet scheduled to a
-  phase.
+  cursors or per-replica connection pooling.
 - Only plain heap tables are supported on the replica side.
 
 ## Verifying the scan-side I/O split (manual check)
 
 Automated `make installcheck` deliberately avoids `BUFFERS`/timing
-assertions — they're stats- and storage-dependent and flaky in CI (see
-`notes/phases.md`, "Phase A: performance testing"). To confirm slicing is
-actually reducing per-replica I/O, run one slice's query directly against
-a replica and check its buffer count:
+assertions — they're stats- and storage-dependent and flaky in CI. To
+confirm slicing is actually reducing per-replica I/O, run one slice's
+query directly against a replica and check its buffer count:
 
 ```sql
 -- on the coordinator: find the real block count and a slice's ctid range
@@ -112,12 +118,13 @@ Confirm:
 
 This proves the block-range split even on a single VM. A genuine
 wall-clock speedup requires independent storage per replica (separate
-disks/volumes, or real separate nodes) — see `notes/phases.md` for why a
-single shared-disk VM cannot demonstrate that.
+disks/volumes, or real separate nodes) — a single shared-disk VM can't
+demonstrate that, since every replica ends up contending for the same
+underlying I/O path.
 
 ## Testing
 
-`make installcheck` runs four suites against a **loopback harness**: all
+`make installcheck` runs six suites against a **loopback harness**: all
 "replicas" point at the same local instance (`replicas
 'localhost:5432,localhost:5432,localhost:5432'`). Disjoint ctid slices
 still union to exactly the whole table, so slicing/fan-out/merge/rescan
@@ -136,6 +143,12 @@ demonstrate a real I/O speedup (see above).
   interspersed `NULL`s round-trip exactly through the text protocol.
 - `errors` — a server with an unreachable replica errors cleanly, names
   the replica, and respects `connect_timeout` instead of hanging.
+- `invalidation` — `ALTER SERVER`/`ALTER USER MAPPING` are picked up by
+  the next query in the same session.
+- `count_pushdown` — unqualified `count(*)` is pushed down (no `Agg`
+  node, correct sum of per-replica partials); every other aggregate
+  shape (`count(DISTINCT ...)`, a `WHERE` clause, `GROUP BY`, `sum`,
+  `HAVING`) falls back to a correct local `Aggregate` over a plain scan.
 
 ```
 make PG_CONFIG=/path/to/pg_config

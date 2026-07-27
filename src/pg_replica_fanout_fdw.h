@@ -52,6 +52,9 @@ typedef struct RepFdwPlanState
 	RepFdwOptions *opts;
 	Oid			foreigntableid;
 	Bitmapset  *attrs_used;	/* columns needed, encoded like pull_varattnos() */
+	bool		is_count_agg;	/* set by GetForeignUpperPaths on the upper
+								 * (GROUP_AGG) rel's copy of this struct;
+								 * read back by GetForeignPlan */
 } RepFdwPlanState;
 
 typedef enum RepConnState
@@ -126,6 +129,14 @@ typedef struct RepFdwScanState
 	WaitEventSet *stream_wes;
 	bool		wes_dirty;		/* active-socket membership changed since
 								 * stream_wes was last built */
+
+	/*
+	 * true for the pushed-down "SELECT count(*)" plan shape (scanrelid==0,
+	 * no fan-out Agg node above this scan): each replica returns one
+	 * partial int8 count and RepFdwNextCountTuple sums them into a single
+	 * emitted row instead of merging raw rows.
+	 */
+	bool		is_count_agg;
 } RepFdwScanState;
 
 /* in option.c */
@@ -154,11 +165,14 @@ extern int	RepFdwComputeSlices(BlockNumber nblocks, int nconns,
 /* in deparse.c */
 extern char *RepFdwDeparseTemplate(Oid foreigntableid, List *retrieved_attrs,
 									const char *schema, const char *table);
+extern char *RepFdwDeparseCountTemplate(const char *schema, const char *table);
 extern char *RepFdwBuildBoundedSql(const char *base_sql,
 									const RepFdwCtidBound *bound);
 
 /* in merge.c */
 extern TupleTableSlot *RepFdwNextTuple(RepFdwScanState *fsstate,
 										ForeignScanState *node);
+extern TupleTableSlot *RepFdwNextCountTuple(RepFdwScanState *fsstate,
+											 ForeignScanState *node);
 
 #endif							/* PG_REPLICA_FANOUT_FDW_H */
