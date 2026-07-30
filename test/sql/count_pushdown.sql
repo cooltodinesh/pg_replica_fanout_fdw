@@ -47,9 +47,13 @@ EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF)
 EXPLAIN (COSTS OFF) SELECT count(DISTINCT id) FROM cft;
 SELECT count(DISTINCT id) FROM cft;
 
--- a WHERE clause: baserestrictinfo != NIL
-EXPLAIN (COSTS OFF) SELECT count(*) FROM cft WHERE id > 100;
-SELECT count(*) FROM cft WHERE id > 100;
+-- a WHERE clause with a non-shippable conjunct: local_conds != NIL, even
+-- though the other conjunct (id > 100) is independently shippable and does
+-- get folded into the remote template's WHERE.  (A WHERE that is *entirely*
+-- shippable, e.g. just "id > 100", legitimately pushes count(*) down with
+-- no Agg node -- see test/sql/qual_pushdown.sql's WHERE + count(*) case.)
+EXPLAIN (COSTS OFF) SELECT count(*) FROM cft WHERE id > 100 AND random() < 2;
+SELECT count(*) FROM cft WHERE id > 100 AND random() < 2;
 
 -- GROUP BY: groupClause != NIL
 EXPLAIN (COSTS OFF) SELECT id, count(*) FROM cft GROUP BY id;

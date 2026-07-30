@@ -111,12 +111,15 @@ RepFdwNextTuple(RepFdwScanState *fsstate, ForeignScanState *node)
 
 /*
  * RepFdwNextCountTuple
- *		Combine step for the count(*) pushdown plan shape (see
- *		notes/phase-b-count.md).  Pumps every replica to REP_DONE, sums the
- *		single int8 partial count each one returns for its ctid slice, and
- *		emits exactly one row.  There is no per-replica interleaving to do
- *		here (unlike RepFdwNextTuple) since nothing is returned until every
- *		replica has finished.
+ *		Combine step for the count(*) pushdown plan shape: each replica
+ *		computes its own partial count(*) over its ctid slice (and the
+ *		pushed WHERE predicate, if any), and this function sums those
+ *		partials into the single row the finished plan emits -- there is no
+ *		Agg node above the Foreign Scan for this plan shape.  Pumps every
+ *		replica to REP_DONE, sums the single int8 partial count each one
+ *		returns, and emits exactly one row.  There is no per-replica
+ *		interleaving to do here (unlike RepFdwNextTuple) since nothing is
+ *		returned until every replica has finished.
  */
 TupleTableSlot *
 RepFdwNextCountTuple(RepFdwScanState *fsstate, ForeignScanState *node)

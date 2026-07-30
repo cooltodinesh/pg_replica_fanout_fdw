@@ -4,9 +4,10 @@ A PostgreSQL foreign-data wrapper that fans a **sliced table scan** across N
 streaming replicas and merges the rows on the coordinator, so that a large
 table scan gets roughly 1/N the I/O per node instead of hitting one server.
 
-It supports a raw fan-out scan plus pushdown of unqualified `count(*)`
-(see "Aggregate pushdown" below); everything else (WHERE, ORDER BY,
-LIMIT, and every other aggregate) is still evaluated locally on the
+It supports a raw fan-out scan, pushdown of shippable `WHERE` quals (see
+"Qual pushdown" below), and pushdown of `count(*)` including a shippable
+`WHERE` (see "Aggregate pushdown" below); everything else (`ORDER BY`,
+`LIMIT`, and every other aggregate) is still evaluated locally on the
 coordinator.
 
 Requires **PostgreSQL 19+** (uses `PQsetChunkedRowsMode`/
@@ -51,23 +52,42 @@ contribute I/O too, just list it in `replicas` like any other node.
 | `min_blocks_per_slice` | FOREIGN TABLE | 128 | anti-over-slicing guard; lower it (e.g. `1`) to force multi-way splits in tests on small tables |
 | `column_name` | COLUMN | the column's own name | remote column name, if it differs from the local one |
 
+## Qual pushdown
+
+- **Shippable `WHERE` quals are sent to the replicas.** Each top-level
+  `AND` conjunct of a `WHERE` clause is pushed independently: `Var`s of the
+  scanned table, `Const`s, comparison operators, `AND`/`OR`/`NOT`,
+  `IS [NOT] NULL`, and `IN`/`= ANY`/`= ALL` are all shippable, as long as
+  the whole conjunct is **immutable**. Every replica evaluates the pushed
+  predicate independently against its own ctid slice, so an expression
+  that could evaluate *differently* per replica — a `STABLE` function like
+  `now()` or `current_user`, or anything `VOLATILE` — is never pushed, even
+  though `STABLE` alone would be safe to ship in an ordinary single-node
+  query. Any conjunct that isn't shippable stays a local `Filter` above the
+  `Foreign Scan`; `EXPLAIN`'s "Remote SQL Template" line shows exactly what
+  was shipped.
+
 ## Aggregate pushdown
 
-- **`count(*)` is pushed down.** An unqualified `SELECT count(*) FROM
-  big_ft` (no `WHERE`, `GROUP BY`, `HAVING`, or `DISTINCT`) is answered by
-  having each replica compute `count(*)` over its own ctid slice and
-  summing the partials on the coordinator — only N small integers cross
-  the network, not every row. `EXPLAIN` shows a single `Foreign Scan`
-  with no `Aggregate` node above it. Anything else (`count(DISTINCT
-  ...)`, a `WHERE` clause, `GROUP BY`, `sum`/`avg`/`min`/`max`, `HAVING`)
-  falls back to fetching every row and aggregating locally.
+- **`count(*)` is pushed down, including a shippable `WHERE`.** A
+  `SELECT count(*) FROM big_ft` with no `GROUP BY`, `HAVING`, or
+  `DISTINCT`, and whose `WHERE` (if any) is entirely shippable per "Qual
+  pushdown" above, is answered by having each replica compute `count(*)`
+  over its own ctid slice (and the pushed predicate, if any) and summing
+  the partials on the coordinator — only N small integers cross the
+  network, not every row. `EXPLAIN` shows a single `Foreign Scan` with no
+  `Aggregate` node above it. Anything else (`count(DISTINCT ...)`, a
+  `WHERE` with a non-shippable conjunct, `GROUP BY`,
+  `sum`/`avg`/`min`/`max`, `HAVING`) falls back to fetching every row and
+  aggregating locally.
 
 ## Known limitations
 
 - **Read-only.** No INSERT/UPDATE/DELETE, no join pushdown.
-- **No pushdown beyond unqualified `count(*)`.** WHERE clauses, `ORDER
-  BY`, `LIMIT`, and every other aggregate are always evaluated locally on
-  the coordinator after every row has been shipped back.
+- **No pushdown beyond shippable `WHERE` quals and `count(*)`.** `ORDER
+  BY`, `LIMIT`, parameterized quals (values coming from a join's outer
+  side), and every other aggregate are always evaluated locally on the
+  coordinator after every row has been shipped back.
 - **`consistency='none'` only.** No LSN alignment; each replica reads
   under its own `REPEATABLE READ` snapshot with no cross-replica skew
   bound. Any connect or scan failure is a plain `ERROR` — there is no
@@ -124,7 +144,7 @@ underlying I/O path.
 
 ## Testing
 
-`make installcheck` runs six suites against a **loopback harness**: all
+`make installcheck` runs seven suites against a **loopback harness**: all
 "replicas" point at the same local instance (`replicas
 'localhost:5432,localhost:5432,localhost:5432'`). Disjoint ctid slices
 still union to exactly the whole table, so slicing/fan-out/merge/rescan
@@ -145,10 +165,17 @@ demonstrate a real I/O speedup (see above).
   the replica, and respects `connect_timeout` instead of hanging.
 - `invalidation` — `ALTER SERVER`/`ALTER USER MAPPING` are picked up by
   the next query in the same session.
-- `count_pushdown` — unqualified `count(*)` is pushed down (no `Agg`
-  node, correct sum of per-replica partials); every other aggregate
-  shape (`count(DISTINCT ...)`, a `WHERE` clause, `GROUP BY`, `sum`,
-  `HAVING`) falls back to a correct local `Aggregate` over a plain scan.
+- `count_pushdown` — `count(*)` (with or without a shippable `WHERE`) is
+  pushed down (no `Agg` node, correct sum of per-replica partials); every
+  other aggregate shape (`count(DISTINCT ...)`, a non-shippable `WHERE`
+  conjunct, `GROUP BY`, `sum`, `HAVING`) falls back to a correct local
+  `Aggregate` over a plain scan.
+- `qual_pushdown` — shippable `WHERE` conjuncts (comparisons, `IN`,
+  `IS NULL`, `OR`, `NOT`, a `column_name`-mapped column) are folded into
+  the remote template and produce correct results; `STABLE` (e.g.
+  `now()`) and `VOLATILE` (e.g. `random()`) conjuncts are rejected and
+  stay a local `Filter`, including in a mixed AND with a shippable
+  conjunct.
 
 ```
 make PG_CONFIG=/path/to/pg_config
@@ -167,7 +194,7 @@ src/
   pg_replica_fanout_fdw.c                handler + FDW plan/exec callbacks
   option.c                        validator, option parsing, replicas-list parser
   connection.c                    conn cache, concurrent connect, streaming loop, xact callbacks
-  deparse.c                       SELECT template with ctid placeholder
+  deparse.c                       SELECT template, qual shippability/deparse, ctid placeholder
   slice.c                         nblocks discovery + block-range math
   merge.c                         round-robin merge + tuple materialization
 test/

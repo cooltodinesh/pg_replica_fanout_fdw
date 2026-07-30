@@ -3,8 +3,9 @@
  * pg_replica_fanout_fdw.c
  *		  Handler and FDW callbacks (plan/exec glue) for pg_replica_fanout_fdw:
  *		  a sliced raw scan fanned out across N streaming replicas,
- *		  merged on the coordinator.  No remote qual pushdown, no ORDER
- *		  BY/aggregate pushdown, no writes.
+ *		  merged on the coordinator.  Shippable (immutable) WHERE quals and
+ *		  unqualified count(*) are pushed down; no ORDER BY/other aggregate
+ *		  pushdown, no writes.
  *
  *-------------------------------------------------------------------------
  */
@@ -86,8 +87,9 @@ pg_replica_fanout_fdw_handler(PG_FUNCTION_ARGS)
 /*
  * repfdwGetForeignRelSize
  *		Parse options, estimate size from local stats, and record which
- *		columns will need to be fetched.  All baserestrictinfo stays local;
- *		remote qual pushdown is not supported.
+ *		columns will need to be fetched.  Classify each baserestrictinfo
+ *		entry as shippable (remote_conds) or not (local_conds) -- see
+ *		RepFdwIsForeignQual for the shippability rule.
  */
 static void
 repfdwGetForeignRelSize(PlannerInfo *root, RelOptInfo *baserel,
@@ -102,12 +104,20 @@ repfdwGetForeignRelSize(PlannerInfo *root, RelOptInfo *baserel,
 	fpinfo->attrs_used = NULL;
 	pull_varattnos((Node *) baserel->reltarget->exprs, baserel->relid,
 				   &fpinfo->attrs_used);
+
 	foreach(lc, baserel->baserestrictinfo)
 	{
 		RestrictInfo *rinfo = lfirst_node(RestrictInfo, lc);
 
-		pull_varattnos((Node *) rinfo->clause, baserel->relid,
-					   &fpinfo->attrs_used);
+		if (!rinfo->pseudoconstant &&
+			RepFdwIsForeignQual(root, baserel, rinfo->clause))
+			fpinfo->remote_conds = lappend(fpinfo->remote_conds, rinfo);
+		else
+		{
+			fpinfo->local_conds = lappend(fpinfo->local_conds, rinfo);
+			pull_varattnos((Node *) rinfo->clause, baserel->relid,
+						   &fpinfo->attrs_used);
+		}
 	}
 
 	baserel->fdw_private = fpinfo;
@@ -160,10 +170,11 @@ repfdwGetForeignPaths(PlannerInfo *root, RelOptInfo *baserel,
 
 /*
  * repfdwGetForeignUpperPaths
- *		Claim UPPERREL_GROUP_AGG for a single, narrow shape: unqualified
- *		count(*) over one of our foreign baserels, no WHERE/GROUP
- *		BY/HAVING/DISTINCT.  Each replica will compute its own partial count
- *		over its ctid slice and the coordinator sums them -- see
+ *		Claim UPPERREL_GROUP_AGG for a single, narrow shape: count(*) over
+ *		one of our foreign baserels, with an entirely shippable WHERE (or
+ *		none) and no GROUP BY/HAVING/DISTINCT.  Each replica will compute
+ *		its own partial count over its ctid slice (and the shippable
+ *		predicate, if any) and the coordinator sums them -- see
  *		RepFdwNextCountTuple in merge.c -- so there is no Agg node above the
  *		Foreign Scan in the finished plan.
  *
@@ -215,10 +226,14 @@ repfdwGetForeignUpperPaths(PlannerInfo *root, UpperRelationKind stage,
 		return;
 
 	/*
-	 * 6. No local qual on the base rel -- we never push quals, so any
-	 * WHERE means the remote count(*) would answer a different question.
+	 * 6. Every qual on the base rel must be shippable.  A non-shippable
+	 * (local-only) qual would have to run against the merged full-table
+	 * scan before counting, which this plan shape has no way to do -- fall
+	 * back to scan + local Agg in that case.  A shippable qual is fine: it
+	 * gets deparsed into the per-slice count(*) below, same as a plain
+	 * scan's remote predicate.
 	 */
-	if (input_rel->baserestrictinfo != NIL)
+	if (ifpinfo->local_conds != NIL)
 		return;
 
 	/*
@@ -248,6 +263,7 @@ repfdwGetForeignUpperPaths(PlannerInfo *root, UpperRelationKind stage,
 	fpinfo->opts = ifpinfo->opts;
 	fpinfo->foreigntableid = ifpinfo->foreigntableid;
 	fpinfo->is_count_agg = true;
+	fpinfo->remote_conds = ifpinfo->remote_conds;
 	output_rel->fdw_private = fpinfo;
 
 	/*
@@ -284,9 +300,11 @@ repfdwGetForeignUpperPaths(PlannerInfo *root, UpperRelationKind stage,
 
 /*
  * repfdwGetForeignPlan
- *		Compute retrieved_attrs from the plan-time attrs_used bitmap and
- *		deparse the ctid-templated remote SELECT.  All scan_clauses are
- *		kept as local quals; remote qual pushdown is not supported.
+ *		Compute retrieved_attrs from the plan-time attrs_used bitmap,
+ *		deparse the ctid-templated remote SELECT, and split scan_clauses
+ *		into a shippable remote predicate and the quals that must stay
+ *		local.  fdw_private is always the same 5-tuple -- see
+ *		RepFdwScanState's comment in the header.
  */
 static ForeignScan *
 repfdwGetForeignPlan(PlannerInfo *root, RelOptInfo *baserel,
@@ -298,39 +316,77 @@ repfdwGetForeignPlan(PlannerInfo *root, RelOptInfo *baserel,
 	List	   *retrieved_attrs = NIL;
 	int			attno = -1;
 	char	   *sql_template;
+	char	   *remote_pred;
 	List	   *fdw_private;
 
 	/*
 	 * The count(*) pushdown plan shape: an upper (GROUP_AGG) rel with
-	 * relid==0, no columns to fetch, and a fixed remote template.  fdw_scan_tlist
-	 * carries the single emitted int8 count column (setrefs.c later folds
-	 * the query's Aggref into a Var referencing it, since scan_relid==0 --
-	 * see notes/phase-b-count.md).  is_count_agg/foreigntableid are also
-	 * duplicated into fdw_private because scan_relid==0 means
-	 * BeginForeignScan/ExplainForeignScan can't get them from
-	 * ss_currentRelation, which will be NULL.
+	 * relid==0, no columns to fetch, and a fixed remote template (plus any
+	 * shippable WHERE qual carried over from the input baserel).
+	 * fdw_scan_tlist carries the single emitted int8 count column, built
+	 * from the same PathTarget (the query's count(*) Aggref) that the core
+	 * planner already put in baserel->reltarget.  Because scan_relid==0,
+	 * setrefs.c's set_foreignscan_references() treats fdw_scan_tlist as the
+	 * scan's raw output tupdesc and rewrites the plan's own targetlist
+	 * entries that structurally match it into plain Var(INDEX_VAR, resno)
+	 * references -- so the Aggref never survives into the executed plan
+	 * tree, and there's no Agg node to complain that it found one outside
+	 * of an Agg.  is_count_agg/foreigntableid are also duplicated into
+	 * fdw_private because scan_relid==0 means BeginForeignScan/
+	 * ExplainForeignScan can't get them from ss_currentRelation, which will
+	 * be NULL.
 	 */
 	if (fpinfo->is_count_agg)
 	{
 		char	   *count_sql = RepFdwDeparseCountTemplate(fpinfo->opts->schema_name,
 														   fpinfo->opts->table_name);
 		List	   *fdw_scan_tlist = make_tlist_from_pathtarget(baserel->reltarget);
-		List	   *count_fdw_private = list_make4(makeString(count_sql),
-												   NIL,
-												   makeBoolean(true),
-												   makeInteger(fpinfo->foreigntableid));
+		List	   *remote_exprs = NIL;
+		ListCell   *lc;
+
+		foreach(lc, fpinfo->remote_conds)
+		{
+			RestrictInfo *rinfo = lfirst_node(RestrictInfo, lc);
+
+			remote_exprs = lappend(remote_exprs, rinfo->clause);
+		}
+		remote_pred = RepFdwDeparseQuals(fpinfo->foreigntableid, remote_exprs);
+
+		fdw_private = list_make5(makeString(count_sql),
+								 NIL,
+								 makeString(remote_pred ? remote_pred : ""),
+								 makeBoolean(true),
+								 makeInteger(fpinfo->foreigntableid));
 
 		return make_foreignscan(tlist,
 								NIL,	/* no local exprs */
 								0,		/* scan_relid */
 								NIL,	/* no fdw_exprs */
-								count_fdw_private,
+								fdw_private,
 								fdw_scan_tlist,
 								NIL,	/* no recheck quals */
 								NULL);	/* no outer plan */
 	}
 
-	scan_clauses = extract_actual_clauses(scan_clauses, false);
+	{
+		List	   *remote_exprs = NIL;
+		List	   *local_exprs = NIL;
+		ListCell   *lc;
+
+		foreach(lc, scan_clauses)
+		{
+			RestrictInfo *rinfo = lfirst_node(RestrictInfo, lc);
+
+			if (list_member_ptr(fpinfo->remote_conds, rinfo))
+				remote_exprs = lappend(remote_exprs, rinfo);
+			else
+				local_exprs = lappend(local_exprs, rinfo);
+		}
+
+		remote_pred = RepFdwDeparseQuals(foreigntableid,
+										 extract_actual_clauses(remote_exprs, false));
+		scan_clauses = extract_actual_clauses(local_exprs, false);
+	}
 
 	if (bms_is_member(0 - FirstLowInvalidHeapAttributeNumber,
 					  fpinfo->attrs_used))
@@ -368,7 +424,11 @@ repfdwGetForeignPlan(PlannerInfo *root, RelOptInfo *baserel,
 										 fpinfo->opts->schema_name,
 										 fpinfo->opts->table_name);
 
-	fdw_private = list_make2(makeString(sql_template), retrieved_attrs);
+	fdw_private = list_make5(makeString(sql_template),
+							 retrieved_attrs,
+							 makeString(remote_pred ? remote_pred : ""),
+							 makeBoolean(false),
+							 makeInteger((int) foreigntableid));
 
 	return make_foreignscan(tlist,
 							scan_clauses,
@@ -393,6 +453,7 @@ repfdwBeginForeignScan(ForeignScanState *node, int eflags)
 	List	   *fdw_private = fsplan->fdw_private;
 	bool		is_count_agg;
 	Oid			foreigntableid;
+	char	   *remote_pred;
 	RepFdwScanState *fsstate;
 	RepFdwOptions *opts;
 	ForeignServer *server;
@@ -404,21 +465,14 @@ repfdwBeginForeignScan(ForeignScanState *node, int eflags)
 		return;
 
 	/*
-	 * scan_relid==0 (the count(*) pushdown plan shape) means
-	 * ss_currentRelation is NULL -- fdw_private carries is_count_agg and
-	 * foreigntableid for exactly this reason.  A plain scan's 2-element
-	 * fdw_private has neither, so fall back to the relation.
+	 * fdw_private is always {sql_template, retrieved_attrs, remote_pred,
+	 * is_count_agg, foreigntableid} -- see the RepFdwScanState comment.
 	 */
-	if (list_length(fdw_private) >= 4)
-	{
-		is_count_agg = boolVal(lthird(fdw_private));
-		foreigntableid = (Oid) intVal(lfourth(fdw_private));
-	}
-	else
-	{
-		is_count_agg = false;
-		foreigntableid = RelationGetRelid(node->ss.ss_currentRelation);
-	}
+	remote_pred = strVal(lthird(fdw_private));
+	if (remote_pred[0] == '\0')
+		remote_pred = NULL;
+	is_count_agg = boolVal(lfourth(fdw_private));
+	foreigntableid = (Oid) intVal(list_nth(fdw_private, 4));
 
 	RepFdwGetOptions(foreigntableid, &opts);
 	server = GetForeignServer(GetForeignTable(foreigntableid)->serverid);
@@ -429,6 +483,7 @@ repfdwBeginForeignScan(ForeignScanState *node, int eflags)
 	fsstate->foreigntableid = foreigntableid;
 	fsstate->sql_template = strVal(linitial(fdw_private));
 	fsstate->retrieved_attrs = (List *) lsecond(fdw_private);
+	fsstate->remote_pred = remote_pred;
 	fsstate->fetch_size = opts->fetch_size;
 	fsstate->is_count_agg = is_count_agg;
 
@@ -457,6 +512,7 @@ repfdwBeginForeignScan(ForeignScanState *node, int eflags)
 	fsstate->replica_sqls = (char **) palloc(sizeof(char *) * fsstate->nslices);
 	for (i = 0; i < fsstate->nslices; i++)
 		fsstate->replica_sqls[i] = RepFdwBuildBoundedSql(fsstate->sql_template,
+														 fsstate->remote_pred,
 														 &bounds[i]);
 
 	RepFdwStartQueries(fsstate->rset, fsstate->nslices, fsstate->replica_sqls,
@@ -567,6 +623,8 @@ repfdwExplainForeignScan(ForeignScanState *node, ExplainState *es)
 	ForeignScan *fsplan = (ForeignScan *) node->ss.ps.plan;
 	List	   *fdw_private = fsplan->fdw_private;
 	char	   *sql_template = strVal(linitial(fdw_private));
+	char	   *remote_pred = strVal(lthird(fdw_private));
+	Oid			foreigntableid = (Oid) intVal(list_nth(fdw_private, 4));
 	RepFdwScanState *fsstate = (RepFdwScanState *) node->fdw_state;
 	int			nreplicas;
 
@@ -575,25 +633,26 @@ repfdwExplainForeignScan(ForeignScanState *node, ExplainState *es)
 	else
 	{
 		RepFdwOptions *opts;
-		Oid			foreigntableid;
 
-		/*
-		 * EXPLAIN-only (no execution): scan_relid==0 means
-		 * ss_currentRelation is NULL for the count(*) pushdown shape, so
-		 * get foreigntableid from fdw_private instead, same as
-		 * BeginForeignScan.
-		 */
-		if (list_length(fdw_private) >= 4)
-			foreigntableid = (Oid) intVal(lfourth(fdw_private));
-		else
-			foreigntableid = RelationGetRelid(node->ss.ss_currentRelation);
-
+		/* EXPLAIN-only (no execution): no per-slice count to report yet. */
 		RepFdwGetOptions(foreigntableid, &opts);
 		nreplicas = list_length(opts->replicas);
 	}
 
 	ExplainPropertyInteger("Replicas", NULL, nreplicas, es);
-	ExplainPropertyText("Remote SQL Template", sql_template, es);
+
+	/*
+	 * Fold the pushed predicate into the same "Remote SQL Template" line
+	 * (rather than a new label), mirroring postgres_fdw's single "Remote
+	 * SQL" line -- existing users don't need new vocabulary.  The internal
+	 * ctid $1/$2 slice bound is omitted here, same as before.
+	 */
+	if (remote_pred[0] != '\0')
+		ExplainPropertyText("Remote SQL Template",
+							psprintf("%s WHERE %s", sql_template, remote_pred),
+							es);
+	else
+		ExplainPropertyText("Remote SQL Template", sql_template, es);
 }
 
 static bool

@@ -91,18 +91,22 @@ SELECT count(DISTINCT id) FROM cft;
    400
 (1 row)
 
--- a WHERE clause: baserestrictinfo != NIL
-EXPLAIN (COSTS OFF) SELECT count(*) FROM cft WHERE id > 100;
-                         QUERY PLAN                         
-------------------------------------------------------------
+-- a WHERE clause with a non-shippable conjunct: local_conds != NIL, even
+-- though the other conjunct (id > 100) is independently shippable and does
+-- get folded into the remote template's WHERE.  (A WHERE that is *entirely*
+-- shippable, e.g. just "id > 100", legitimately pushes count(*) down with
+-- no Agg node -- see test/sql/qual_pushdown.sql's WHERE + count(*) case.)
+EXPLAIN (COSTS OFF) SELECT count(*) FROM cft WHERE id > 100 AND random() < 2;
+                                        QUERY PLAN                                        
+------------------------------------------------------------------------------------------
  Aggregate
    ->  Foreign Scan on cft
-         Filter: (id > 100)
+         Filter: (random() < '2'::double precision)
          Replicas: 3
-         Remote SQL Template: SELECT id FROM public.count_t
+         Remote SQL Template: SELECT NULL FROM public.count_t WHERE (id > '100'::integer)
 (5 rows)
 
-SELECT count(*) FROM cft WHERE id > 100;
+SELECT count(*) FROM cft WHERE id > 100 AND random() < 2;
  count 
 -------
    300

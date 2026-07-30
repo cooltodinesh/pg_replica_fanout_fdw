@@ -2,8 +2,9 @@
  *
  * pg_replica_fanout_fdw.h
  *		  Foreign-data wrapper that fans a sliced scan across N streaming
- *		  replicas and merges rows on the coordinator.  Read-only, no
- *		  remote qual/sort/aggregate pushdown.
+ *		  replicas and merges rows on the coordinator.  Read-only.  Pushes
+ *		  down shippable (immutable) WHERE quals and unqualified count(*);
+ *		  no remote sort/other-aggregate pushdown.
  *
  *-------------------------------------------------------------------------
  */
@@ -55,6 +56,10 @@ typedef struct RepFdwPlanState
 	bool		is_count_agg;	/* set by GetForeignUpperPaths on the upper
 								 * (GROUP_AGG) rel's copy of this struct;
 								 * read back by GetForeignPlan */
+	List	   *remote_conds;	/* RestrictInfos safe to ship (see
+								 * RepFdwIsForeignQual); on the upper rel,
+								 * copied from the input baserel's fpinfo */
+	List	   *local_conds;	/* RestrictInfos that must stay local */
 } RepFdwPlanState;
 
 typedef enum RepConnState
@@ -97,7 +102,13 @@ typedef struct ReplicaSet
 								 * conns need to be rebuilt when it's safe */
 } ReplicaSet;
 
-/* fdw_private (plan -> exec): {sql_template, retrieved_attrs} */
+/*
+ * fdw_private (plan -> exec), one positional layout for both the plain-scan
+ * and count(*) pushdown plan shapes:
+ *   {sql_template, retrieved_attrs, remote_pred, is_count_agg, foreigntableid}
+ * remote_pred is an empty string, not NIL, when there is no pushed predicate
+ * (a plain string node keeps the list a fixed-arity 5-tuple).
+ */
 typedef struct RepFdwScanState
 {
 	ReplicaSet *rset;
@@ -105,6 +116,8 @@ typedef struct RepFdwScanState
 	Oid			foreigntableid;
 	char	   *sql_template;	/* "SELECT ... FROM ...", no WHERE yet */
 	List	   *retrieved_attrs;	/* ascending attnums fetched from replicas */
+	char	   *remote_pred;	/* pushed-down WHERE predicate, no leading
+								 * "WHERE" and no ctid bound; NULL if none */
 	int			fetch_size;
 
 	/* slicing, computed once in BeginForeignScan */
@@ -167,7 +180,11 @@ extern char *RepFdwDeparseTemplate(Oid foreigntableid, List *retrieved_attrs,
 									const char *schema, const char *table);
 extern char *RepFdwDeparseCountTemplate(const char *schema, const char *table);
 extern char *RepFdwBuildBoundedSql(const char *base_sql,
+									const char *remote_pred,
 									const RepFdwCtidBound *bound);
+extern bool RepFdwIsForeignQual(PlannerInfo *root, RelOptInfo *baserel,
+								 Expr *expr);
+extern char *RepFdwDeparseQuals(Oid foreigntableid, List *remote_exprs);
 
 /* in merge.c */
 extern TupleTableSlot *RepFdwNextTuple(RepFdwScanState *fsstate,
