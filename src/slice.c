@@ -14,14 +14,15 @@
 
 /*
  * RepFdwGetNBlocks
- *		Discover the table's size, in blocks, via replica 0 (inside its
- *		already-open REPEATABLE READ txn, so it's a stable snapshot read).
- *		todo: can this be done on local co-ordinator instance instead of replica 0
+ *		Discover the table's size, in blocks, on the given replica connection
+ *		(inside its already-open REPEATABLE READ txn, so it's a stable
+ *		snapshot read).  In v2 each Append child asks its own replica; physical
+ *		replicas share the primary's heap, so all agree (modulo replay lag --
+ *		the LSN-consistency caveat documented in notes/v2-append-architecture.md).
  */
 BlockNumber
-RepFdwGetNBlocks(ReplicaSet *rset, const char *schema, const char *table)
+RepFdwGetNBlocks(ReplicaConn *rconn, const char *schema, const char *table)
 {
-	ReplicaConn *rconn = &rset->conns[0];
 	char	   *qualified = quote_qualified_identifier(schema, table);
 	char	   *literal = quote_literal_cstr(qualified);
 	StringInfoData sql;

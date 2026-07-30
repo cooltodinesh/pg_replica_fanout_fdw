@@ -488,6 +488,64 @@ RepFdwExecSync(ReplicaConn *rconn, const char *sql)
 }
 
 /*
+ * RepFdwExecBounded
+ *		Run one ctid-bounded slice query on a single replica connection,
+ *		blocking (but interruptibly) until the whole result is in, and return
+ *		the PGRES_TUPLES_OK result.  Binds the $1/$2 ctid bounds the same way
+ *		RepFdwStartQueries does.  Drains to the terminating NULL result so
+ *		libpq's asyncStatus returns to IDLE and the connection is immediately
+ *		reusable (e.g. by ReScan).  This is the v2 M0 synchronous per-node
+ *		path; async streaming is M0b.
+ */
+PGresult *
+RepFdwExecBounded(ReplicaConn *rconn, const char *sql,
+				  const RepFdwCtidBound *bound)
+{
+	Oid			paramTypes[2];
+	const char *paramValues[2];
+	int			nparams = 0;
+	PGresult   *res = NULL;
+
+	if (bound->lo != NULL)
+	{
+		paramTypes[nparams] = TIDOID;
+		paramValues[nparams] = bound->lo;
+		nparams++;
+	}
+	if (bound->hi != NULL)
+	{
+		paramTypes[nparams] = TIDOID;
+		paramValues[nparams] = bound->hi;
+		nparams++;
+	}
+
+	if (!PQsendQueryParams(rconn->conn, sql, nparams, paramTypes,
+						   paramValues, NULL, NULL, 0))
+		RepFdwReportError(NULL, rconn, sql);
+
+	for (;;)
+	{
+		PGresult   *r = libpqsrv_get_result(rconn->conn, we_stream);
+
+		if (r == NULL)
+			break;
+		if (PQresultStatus(r) == PGRES_TUPLES_OK)
+		{
+			if (res != NULL)
+				PQclear(res);
+			res = r;
+		}
+		else if (PQresultStatus(r) == PGRES_FATAL_ERROR)
+			RepFdwReportError(r, rconn, sql);	/* does not return */
+		else
+			PQclear(r);
+	}
+
+	rconn->state = REP_IN_TXN;
+	return res;
+}
+
+/*
  * RepFdwStartQueries
  *		Send the per-replica SELECT (ctid range bound via $1/$2) to the
  *		first nactive connections, in chunked-rows streaming mode.

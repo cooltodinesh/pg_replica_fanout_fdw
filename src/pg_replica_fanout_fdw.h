@@ -150,6 +150,19 @@ typedef struct RepFdwScanState
 	 * emitted row instead of merging raw rows.
 	 */
 	bool		is_count_agg;
+
+	/*
+	 * v2 (M0) per-replica scan state.  In the v2 architecture each replica's
+	 * slice is a separate ForeignScan node under an Append (see
+	 * notes/v2-append-architecture.md); this node owns exactly one replica.
+	 * M0 is deliberately synchronous: my_res holds the whole slice result
+	 * (blocking exec) and my_row walks it.  Async streaming is M0b.
+	 */
+	int			my_index;		/* this node's replica/slice index */
+	int			nreplicas;		/* total replicas = Append child count */
+	PGresult   *my_res;			/* this slice's full result, or NULL if idle */
+	int			my_row;			/* cursor within my_res */
+	bool		my_active;		/* false when my_index >= P (no slice) */
 } RepFdwScanState;
 
 /* in option.c */
@@ -165,11 +178,13 @@ extern void RepStreamPump(struct RepFdwScanState *fsstate);
 extern int	RepFdwQueuedRowCount(ReplicaConn *rconn);
 extern void RepFdwCancelAndDrain(ReplicaSet *rset, int nactive);
 extern PGresult *RepFdwExecSync(ReplicaConn *rconn, const char *sql);
+extern PGresult *RepFdwExecBounded(ReplicaConn *rconn, const char *sql,
+								   const RepFdwCtidBound *bound);
 pg_noreturn extern void RepFdwReportError(PGresult *res, ReplicaConn *rconn,
 										   const char *sql);
 
 /* in slice.c */
-extern BlockNumber RepFdwGetNBlocks(ReplicaSet *rset, const char *schema,
+extern BlockNumber RepFdwGetNBlocks(ReplicaConn *rconn, const char *schema,
 									 const char *table);
 extern int	RepFdwComputeSlices(BlockNumber nblocks, int nconns,
 								 int min_blocks_per_slice,

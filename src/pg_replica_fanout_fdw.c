@@ -16,6 +16,7 @@
 #include "access/tupdesc.h"
 #include "commands/explain_format.h"
 #include "commands/explain_state.h"
+#include "executor/tuptable.h"
 #include "foreign/fdwapi.h"
 #include "foreign/foreign.h"
 #include "funcapi.h"
@@ -127,19 +128,19 @@ repfdwGetForeignRelSize(PlannerInfo *root, RelOptInfo *baserel,
 }
 
 /*
- * repfdwGetForeignPaths
- *		A single path, costed as (page cost / N replicas) + per-row cost --
- *		intended to make the planner prefer this FDW over a plain seqscan
- *		roughly in proportion to the fan-out.  In practice baserel->pages is
- *		0 for any foreign table that has never been ANALYZEd (there's no
- *		AnalyzeForeignTable callback here to populate pg_class.relpages), so
- *		the page-cost term -- and hence this whole division by nreplicas --
- *		is usually a no-op; only the flat per-row term ends up mattering.
- *		This is a real limitation of the cost model, not just a comment
- *		nicety: don't rely on EXPLAIN cost numbers to judge the fan-out
- *		benefit. Fixing it (e.g. a crude remote pg_relation_size-based
- *		estimate) would need a planning-time round-trip and is out of scope
- *		here.
+ * repfdwGetForeignPaths (v2 -- M0)
+ *		Instead of one fan-out ForeignScan, emit an Append of N per-replica
+ *		ForeignScan paths -- one child per replica, each carrying its replica
+ *		index in the path's fdw_private.  The core planner then stacks native
+ *		Agg/Sort/Join nodes on top of the Append, and (M0b) an async-capable
+ *		Append drives all N children concurrently.  create_append_path
+ *		explicitly supports a RELOPT_BASEREL parent, and async is gated only on
+ *		the FDW routine + per-path capability, never on real partitioning --
+ *		see the M0 findings in notes/v2-append-architecture.md.
+ *
+ *		Cost note (unchanged from v1): baserel->pages is 0 without ANALYZE, so
+ *		the per-replica page-cost division is usually a no-op; don't read the
+ *		fan-out benefit off EXPLAIN cost numbers.
  */
 static void
 repfdwGetForeignPaths(PlannerInfo *root, RelOptInfo *baserel,
@@ -147,25 +148,43 @@ repfdwGetForeignPaths(PlannerInfo *root, RelOptInfo *baserel,
 {
 	RepFdwPlanState *fpinfo = (RepFdwPlanState *) baserel->fdw_private;
 	int			nreplicas = Max(1, list_length(fpinfo->opts->replicas));
-	Cost		startup_cost = 0;
-	Cost		total_cost;
+	double		per_child_rows = clamp_row_est(baserel->rows / nreplicas);
+	List	   *subpaths = NIL;
+	AppendPathInput input;
+	int			i;
 
-	total_cost = startup_cost
-		+ (seq_page_cost * baserel->pages) / nreplicas
-		+ cpu_tuple_cost * clamp_row_est(baserel->rows);
+	for (i = 0; i < nreplicas; i++)
+	{
+		Cost		startup_cost = 0;
+		Cost		total_cost = startup_cost
+			+ (seq_page_cost * baserel->pages) / nreplicas
+			+ cpu_tuple_cost * per_child_rows;
+		ForeignPath *child;
+
+		child = create_foreignscan_path(root, baserel,
+										NULL,	/* default pathtarget */
+										per_child_rows,
+										0,		/* disabled_nodes */
+										startup_cost,
+										total_cost,
+										NIL,	/* no pathkeys */
+										baserel->lateral_relids,
+										NULL,	/* no outer plan */
+										NIL,	/* no fdw_restrictinfo */
+										list_make1(makeInteger(i)));
+		subpaths = lappend(subpaths, child);
+	}
+
+	MemSet(&input, 0, sizeof(input));
+	input.subpaths = subpaths;
 
 	add_path(baserel, (Path *)
-			 create_foreignscan_path(root, baserel,
-									 NULL,	/* default pathtarget */
-									 baserel->rows,
-									 0,
-									 startup_cost,
-									 total_cost,
-									 NIL,	/* no pathkeys */
-									 baserel->lateral_relids,
-									 NULL,	/* no outer plan */
-									 NIL,	/* no fdw_restrictinfo */
-									 NIL));	/* no fdw_private needed yet */
+			 create_append_path(root, baserel, input,
+								 NIL,	/* no pathkeys */
+								 baserel->lateral_relids,
+								 0,		/* parallel_workers */
+								 false, /* parallel_aware */
+								 clamp_row_est(baserel->rows)));
 }
 
 /*
@@ -194,6 +213,16 @@ repfdwGetForeignUpperPaths(PlannerInfo *root, UpperRelationKind stage,
 	Cost		startup_cost;
 	Cost		total_cost;
 	ForeignPath *path;
+
+	/*
+	 * v2 (M0): aggregation is handled by native Agg nodes stacked on the
+	 * Append of per-replica scans (see repfdwGetForeignPaths and
+	 * notes/v2-append-architecture.md), not by an internal combine.  The v1
+	 * count(*) upper-path pushdown below is disabled for now; remote
+	 * partial-aggregate pushdown is a later milestone (M3), at which point
+	 * this becomes a per-child Partial Aggregate + local Finalize.
+	 */
+	return;
 
 	/* 1. Only the plain full-aggregation upper stage; ignore the rest. */
 	if (stage != UPPERREL_GROUP_AGG)
@@ -424,11 +453,21 @@ repfdwGetForeignPlan(PlannerInfo *root, RelOptInfo *baserel,
 										 fpinfo->opts->schema_name,
 										 fpinfo->opts->table_name);
 
+	/*
+	 * v2 (M0): this is one Append child.  Its replica/slice index rides in the
+	 * child ForeignPath's fdw_private (set in repfdwGetForeignPaths); append it
+	 * plus the total replica count to the plan-time fdw_private so
+	 * BeginForeignScan knows which replica it owns and how to slice.
+	 */
 	fdw_private = list_make5(makeString(sql_template),
 							 retrieved_attrs,
 							 makeString(remote_pred ? remote_pred : ""),
 							 makeBoolean(false),
 							 makeInteger((int) foreigntableid));
+	fdw_private = lappend(fdw_private,
+						  makeInteger(intVal(linitial(best_path->fdw_private))));
+	fdw_private = lappend(fdw_private,
+						  makeInteger(list_length(fpinfo->opts->replicas)));
 
 	return make_foreignscan(tlist,
 							scan_clauses,
@@ -441,37 +480,74 @@ repfdwGetForeignPlan(PlannerInfo *root, RelOptInfo *baserel,
 }
 
 /*
- * repfdwBeginForeignScan
- *		Get/connect the cached replica set, open the remote read-only
- *		transaction, discover the table's block count, compute slices, and
- *		kick off one streaming query per participating replica.
+ * repfdw_run_slice_query
+ *		Issue this Append child's slice query on its own replica connection and
+ *		buffer the whole result (v2 M0 synchronous path).  Discovers nblocks
+ *		from this node's replica, computes the P disjoint slices, and -- if
+ *		this node's index is within P -- runs "SELECT ... WHERE <ctid slice>".
+ *		A node whose index is >= P (fewer blocks than replicas) is idle and
+ *		returns no rows.
+ */
+static void
+repfdw_run_slice_query(RepFdwScanState *fsstate)
+{
+	ReplicaConn *rconn = &fsstate->rset->conns[fsstate->my_index];
+	RepFdwCtidBound *bounds;
+	BlockNumber nblocks;
+	int			P;
+	char	   *sql;
+
+	nblocks = RepFdwGetNBlocks(rconn, fsstate->opts->schema_name,
+							   fsstate->opts->table_name);
+	P = RepFdwComputeSlices(nblocks, fsstate->nreplicas,
+							fsstate->opts->min_blocks_per_slice, &bounds);
+
+	if (fsstate->my_index >= P)
+	{
+		fsstate->my_active = false;
+		fsstate->my_res = NULL;
+		fsstate->my_row = 0;
+		return;
+	}
+
+	sql = RepFdwBuildBoundedSql(fsstate->sql_template, fsstate->remote_pred,
+							   &bounds[fsstate->my_index]);
+	fsstate->my_res = RepFdwExecBounded(rconn, sql, &bounds[fsstate->my_index]);
+	fsstate->my_row = 0;
+	fsstate->my_active = true;
+}
+
+/*
+ * repfdwBeginForeignScan (v2 -- M0)
+ *		One Append child = one replica.  Connect the cached replica set, open
+ *		the shared remote read-only transaction (idempotent across siblings),
+ *		and run this node's slice query synchronously.  Async streaming and
+ *		per-node connection ownership are later milestones; for now sibling
+ *		children share the cached ReplicaSet, each driving conns[my_index].
  */
 static void
 repfdwBeginForeignScan(ForeignScanState *node, int eflags)
 {
 	ForeignScan *fsplan = (ForeignScan *) node->ss.ps.plan;
 	List	   *fdw_private = fsplan->fdw_private;
-	bool		is_count_agg;
 	Oid			foreigntableid;
 	char	   *remote_pred;
 	RepFdwScanState *fsstate;
 	RepFdwOptions *opts;
 	ForeignServer *server;
 	UserMapping *user;
-	RepFdwCtidBound *bounds;
-	int			i;
 
 	if (eflags & EXEC_FLAG_EXPLAIN_ONLY)
 		return;
 
 	/*
-	 * fdw_private is always {sql_template, retrieved_attrs, remote_pred,
-	 * is_count_agg, foreigntableid} -- see the RepFdwScanState comment.
+	 * Plan-time fdw_private for a v2 Append child:
+	 *   {sql_template, retrieved_attrs, remote_pred, is_count_agg(false),
+	 *    foreigntableid, my_index, nreplicas}
 	 */
 	remote_pred = strVal(lthird(fdw_private));
 	if (remote_pred[0] == '\0')
 		remote_pred = NULL;
-	is_count_agg = boolVal(lfourth(fdw_private));
 	foreigntableid = (Oid) intVal(list_nth(fdw_private, 4));
 
 	RepFdwGetOptions(foreigntableid, &opts);
@@ -485,73 +561,77 @@ repfdwBeginForeignScan(ForeignScanState *node, int eflags)
 	fsstate->retrieved_attrs = (List *) lsecond(fdw_private);
 	fsstate->remote_pred = remote_pred;
 	fsstate->fetch_size = opts->fetch_size;
-	fsstate->is_count_agg = is_count_agg;
+	fsstate->my_index = intVal(list_nth(fdw_private, 5));
+	fsstate->nreplicas = intVal(list_nth(fdw_private, 6));
 
 	fsstate->rset = RepFdwGetConnections(user, opts);
-
-	if (fsstate->rset->active_scan != NULL &&
-		fsstate->rset->active_scan != fsstate)
-		ereport(ERROR,
-				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("pg_replica_fanout_fdw cannot run two concurrent scans on foreign server \"%s\"",
-						server->servername),
-				 errdetail("Each replica connection streams one query at a time, so only one foreign scan per server can be live at once."),
-				 errhint("Rewrite so a single scan of this server is active at a time (e.g. materialize one side with a CTE, or place the tables on separate servers).")));
-	fsstate->rset->active_scan = fsstate;
-
 	RepFdwBeginRemoteXact(fsstate->rset);
 
-	fsstate->nblocks = RepFdwGetNBlocks(fsstate->rset, opts->schema_name,
-										opts->table_name);
-	fsstate->nslices = RepFdwComputeSlices(fsstate->nblocks,
-										   fsstate->rset->nconns,
-										   opts->min_blocks_per_slice,
-										   &bounds);
-	fsstate->replica_bounds = bounds;
-
-	fsstate->replica_sqls = (char **) palloc(sizeof(char *) * fsstate->nslices);
-	for (i = 0; i < fsstate->nslices; i++)
-		fsstate->replica_sqls[i] = RepFdwBuildBoundedSql(fsstate->sql_template,
-														 fsstate->remote_pred,
-														 &bounds[i]);
-
-	RepFdwStartQueries(fsstate->rset, fsstate->nslices, fsstate->replica_sqls,
-					   fsstate->replica_bounds, fsstate->fetch_size);
-
-	/*
-	 * The count(*) merge path (RepFdwNextCountTuple) parses one int8 cell
-	 * directly and never needs attinmeta; only the plain-scan merge path
-	 * (RepFdwNextTuple) does.
-	 */
-	fsstate->attinmeta = is_count_agg ? NULL :
+	fsstate->attinmeta =
 		TupleDescGetAttInMetadata(RelationGetDescr(node->ss.ss_currentRelation));
-	fsstate->rr_cursor = 0;
-	fsstate->batch_cxt = AllocSetContextCreate(CurrentMemoryContext,
-											   "pg_replica_fanout_fdw batch",
-											   ALLOCSET_DEFAULT_SIZES);
 	fsstate->row_cxt = AllocSetContextCreate(CurrentMemoryContext,
 											 "pg_replica_fanout_fdw row",
 											 ALLOCSET_SMALL_SIZES);
 
 	node->fdw_state = fsstate;
+
+	repfdw_run_slice_query(fsstate);
 }
 
+/*
+ * repfdwIterateForeignScan (v2 -- M0)
+ *		Return the next buffered row from this node's slice result, materializing
+ *		it through attinmeta (retrieved_attrs maps result columns to attnums).
+ */
 static TupleTableSlot *
 repfdwIterateForeignScan(ForeignScanState *node)
 {
 	RepFdwScanState *fsstate = (RepFdwScanState *) node->fdw_state;
+	TupleTableSlot *slot = node->ss.ss_ScanTupleSlot;
+	PGresult   *res = fsstate->my_res;
+	HeapTuple	tuple;
+	char	  **values;
+	int			natts;
+	int			j;
+	ListCell   *lc;
+	MemoryContext oldcxt;
 
-	if (fsstate->is_count_agg)
-		return RepFdwNextCountTuple(fsstate, node);
+	if (!fsstate->my_active || res == NULL ||
+		fsstate->my_row >= PQntuples(res))
+	{
+		ExecClearTuple(slot);
+		return slot;
+	}
 
-	return RepFdwNextTuple(fsstate, node);
+	natts = fsstate->attinmeta->tupdesc->natts;
+
+	MemoryContextReset(fsstate->row_cxt);
+	oldcxt = MemoryContextSwitchTo(fsstate->row_cxt);
+
+	values = (char **) palloc0(sizeof(char *) * natts);
+	j = 0;
+	foreach(lc, fsstate->retrieved_attrs)
+	{
+		int			attnum = lfirst_int(lc);
+
+		if (!PQgetisnull(res, fsstate->my_row, j))
+			values[attnum - 1] = PQgetvalue(res, fsstate->my_row, j);
+		j++;
+	}
+	tuple = BuildTupleFromCStrings(fsstate->attinmeta, values);
+
+	MemoryContextSwitchTo(oldcxt);
+
+	fsstate->my_row++;
+	ExecStoreHeapTuple(tuple, slot, false);
+	return slot;
 }
 
 /*
- * repfdwReScanForeignScan
- *		Cancel/drain any in-flight query and resend the same per-replica SQL
- *		(the remote snapshot is unchanged, so this is exactly repeatable;
- *		nblocks/slicing does not need to be recomputed).
+ * repfdwReScanForeignScan (v2 -- M0)
+ *		Re-run this node's slice query.  The blocking exec left the connection
+ *		idle-in-transaction and the remote snapshot is unchanged, so this is
+ *		exactly repeatable.
  */
 static void
 repfdwReScanForeignScan(ForeignScanState *node)
@@ -561,34 +641,20 @@ repfdwReScanForeignScan(ForeignScanState *node)
 	if (fsstate == NULL)
 		return;
 
-	RepFdwCancelAndDrain(fsstate->rset, fsstate->nslices);
-
-	/* active-socket membership resets when the queries are resent */
-	if (fsstate->stream_wes != NULL)
+	if (fsstate->my_res != NULL)
 	{
-		FreeWaitEventSet(fsstate->stream_wes);
-		fsstate->stream_wes = NULL;
+		PQclear(fsstate->my_res);
+		fsstate->my_res = NULL;
 	}
-	fsstate->wes_dirty = false;
 
-	RepFdwStartQueries(fsstate->rset, fsstate->nslices, fsstate->replica_sqls,
-					   fsstate->replica_bounds, fsstate->fetch_size);
-	fsstate->rr_cursor = 0;
-
-	/*
-	 * The count(*) combine path emits exactly one row and then latches eof;
-	 * a rescan (e.g. this scan on the inner side of a nestloop) must clear it
-	 * so the resent queries produce the count again.  The plain-scan path does
-	 * not read eof, so this is harmless there.
-	 */
-	fsstate->eof = false;
+	repfdw_run_slice_query(fsstate);
 }
 
 /*
- * repfdwEndForeignScan
- *		Drain/cancel outstanding results so the cached connections are left
- *		idle; the connections themselves and the remote transaction are
- *		left for the xact callback to close at local commit/abort.
+ * repfdwEndForeignScan (v2 -- M0)
+ *		Free this node's buffered result.  The shared connections and remote
+ *		transaction are left for the xact callback to close at local
+ *		commit/abort; the blocking exec already left the connection idle.
  */
 static void
 repfdwEndForeignScan(ForeignScanState *node)
@@ -598,24 +664,19 @@ repfdwEndForeignScan(ForeignScanState *node)
 	if (fsstate == NULL)
 		return;
 
-	RepFdwCancelAndDrain(fsstate->rset, fsstate->nslices);
-
-	if (fsstate->rset != NULL && fsstate->rset->active_scan == fsstate)
-		fsstate->rset->active_scan = NULL;
-
-	if (fsstate->stream_wes != NULL)
-		FreeWaitEventSet(fsstate->stream_wes);
-
-	if (fsstate->batch_cxt)
-		MemoryContextDelete(fsstate->batch_cxt);
+	if (fsstate->my_res != NULL)
+	{
+		PQclear(fsstate->my_res);
+		fsstate->my_res = NULL;
+	}
 	if (fsstate->row_cxt)
 		MemoryContextDelete(fsstate->row_cxt);
 }
 
 /*
- * repfdwExplainForeignScan
- *		Minimal EXPLAIN output: replica count and the remote SQL template.
- *		Per-replica concrete ranges/row counts are not shown.
+ * repfdwExplainForeignScan (v2 -- M0)
+ *		Per-child EXPLAIN: which replica this scan targets (of how many) and its
+ *		remote SQL template.  N such Foreign Scans appear under the Append.
  */
 static void
 repfdwExplainForeignScan(ForeignScanState *node, ExplainState *es)
@@ -624,28 +685,16 @@ repfdwExplainForeignScan(ForeignScanState *node, ExplainState *es)
 	List	   *fdw_private = fsplan->fdw_private;
 	char	   *sql_template = strVal(linitial(fdw_private));
 	char	   *remote_pred = strVal(lthird(fdw_private));
-	Oid			foreigntableid = (Oid) intVal(list_nth(fdw_private, 4));
-	RepFdwScanState *fsstate = (RepFdwScanState *) node->fdw_state;
-	int			nreplicas;
+	int			my_index = intVal(list_nth(fdw_private, 5));
+	int			nreplicas = intVal(list_nth(fdw_private, 6));
 
-	if (fsstate != NULL)
-		nreplicas = fsstate->nslices;
-	else
-	{
-		RepFdwOptions *opts;
-
-		/* EXPLAIN-only (no execution): no per-slice count to report yet. */
-		RepFdwGetOptions(foreigntableid, &opts);
-		nreplicas = list_length(opts->replicas);
-	}
-
+	ExplainPropertyInteger("Replica", NULL, my_index, es);
 	ExplainPropertyInteger("Replicas", NULL, nreplicas, es);
 
 	/*
 	 * Fold the pushed predicate into the same "Remote SQL Template" line
-	 * (rather than a new label), mirroring postgres_fdw's single "Remote
-	 * SQL" line -- existing users don't need new vocabulary.  The internal
-	 * ctid $1/$2 slice bound is omitted here, same as before.
+	 * (rather than a new label), mirroring postgres_fdw's single "Remote SQL"
+	 * line.  The internal ctid $1/$2 slice bound is omitted here.
 	 */
 	if (remote_pred[0] != '\0')
 		ExplainPropertyText("Remote SQL Template",
