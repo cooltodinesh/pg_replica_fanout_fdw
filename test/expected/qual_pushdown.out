@@ -1,6 +1,6 @@
 -- qual_pushdown.sql: shippable top-level AND conjuncts of a WHERE clause are
--- pushed into each replica's per-slice query; everything else stays a local
--- Filter above the (uncombined) Foreign Scan.
+-- pushed into each replica's per-slice query (each Append child's remote SQL);
+-- everything else stays a local Filter on the Async Foreign Scan.
 --
 -- The governing rule: N replicas each evaluate the pushed predicate
 -- independently against their own ctid slice, so the fan-out answer equals
@@ -8,7 +8,7 @@
 -- than postgres_fdw, which ships STABLE functions (e.g. now()) freely -- we
 -- must not, since replicas' clocks and snapshots can differ.  Checks below
 -- are deliberately *discriminating*, in the same style as
--- test/sql/count_pushdown.sql.
+-- test/sql/aggregation.sql.
 \i test/loopback-setup.sql
 -- test/loopback-setup.sql
 --
@@ -48,12 +48,22 @@ CREATE FOREIGN TABLE qft (id int, pad text, ts timestamptz)
 -- 1. A shippable qual on a plain scan is folded into the remote template's
 -- WHERE, with no local Filter at all.
 EXPLAIN (COSTS OFF) SELECT id FROM qft WHERE id > 100;
-                                   QUERY PLAN                                    
----------------------------------------------------------------------------------
- Foreign Scan on qft
-   Replicas: 3
-   Remote SQL Template: SELECT id FROM public.qual_t WHERE (id > '100'::integer)
-(3 rows)
+                                      QUERY PLAN                                       
+---------------------------------------------------------------------------------------
+ Append
+   ->  Async Foreign Scan on qft
+         Replica: 0
+         Replicas: 3
+         Remote SQL Template: SELECT id FROM public.qual_t WHERE (id > '100'::integer)
+   ->  Async Foreign Scan on qft
+         Replica: 1
+         Replicas: 3
+         Remote SQL Template: SELECT id FROM public.qual_t WHERE (id > '100'::integer)
+   ->  Async Foreign Scan on qft
+         Replica: 2
+         Replicas: 3
+         Remote SQL Template: SELECT id FROM public.qual_t WHERE (id > '100'::integer)
+(13 rows)
 
 SELECT count(*) FROM qft WHERE id > 100;
  count 
@@ -67,27 +77,51 @@ SELECT count(*) FROM qft WHERE id > 100;
 -- ends up half remote, half local.  (random() makes the row count
 -- nondeterministic, so only the plan shape is checked here.)
 EXPLAIN (COSTS OFF) SELECT id FROM qft WHERE id > 100 AND random() < 0.5;
-                                   QUERY PLAN                                    
----------------------------------------------------------------------------------
- Foreign Scan on qft
-   Filter: (random() < '0.5'::double precision)
-   Replicas: 3
-   Remote SQL Template: SELECT id FROM public.qual_t WHERE (id > '100'::integer)
-(4 rows)
+                                      QUERY PLAN                                       
+---------------------------------------------------------------------------------------
+ Append
+   ->  Async Foreign Scan on qft
+         Filter: (random() < '0.5'::double precision)
+         Replica: 0
+         Replicas: 3
+         Remote SQL Template: SELECT id FROM public.qual_t WHERE (id > '100'::integer)
+   ->  Async Foreign Scan on qft
+         Filter: (random() < '0.5'::double precision)
+         Replica: 1
+         Replicas: 3
+         Remote SQL Template: SELECT id FROM public.qual_t WHERE (id > '100'::integer)
+   ->  Async Foreign Scan on qft
+         Filter: (random() < '0.5'::double precision)
+         Replica: 2
+         Replicas: 3
+         Remote SQL Template: SELECT id FROM public.qual_t WHERE (id > '100'::integer)
+(16 rows)
 
 -- 3. STABLE is rejected (the crux of this suite): now() can read a
 -- different value on each replica's connection, so "ts < now()" must stay
 -- a local Filter and the remote template must have NO WHERE at all -- the
 -- deliberate divergence from postgres_fdw, which would ship this.
 EXPLAIN (COSTS OFF) SELECT count(*) FROM qft WHERE ts < now();
-                        QUERY PLAN                         
------------------------------------------------------------
+                           QUERY PLAN                            
+-----------------------------------------------------------------
  Aggregate
-   ->  Foreign Scan on qft
-         Filter: (ts < now())
-         Replicas: 3
-         Remote SQL Template: SELECT ts FROM public.qual_t
-(5 rows)
+   ->  Append
+         ->  Async Foreign Scan on qft
+               Filter: (ts < now())
+               Replica: 0
+               Replicas: 3
+               Remote SQL Template: SELECT ts FROM public.qual_t
+         ->  Async Foreign Scan on qft
+               Filter: (ts < now())
+               Replica: 1
+               Replicas: 3
+               Remote SQL Template: SELECT ts FROM public.qual_t
+         ->  Async Foreign Scan on qft
+               Filter: (ts < now())
+               Replica: 2
+               Replicas: 3
+               Remote SQL Template: SELECT ts FROM public.qual_t
+(17 rows)
 
 SELECT count(*) FROM qft WHERE ts < now();
  count 
@@ -99,22 +133,45 @@ SELECT count(*) FROM qft WHERE ts < now();
 -- a cast/arithmetic.  Nondeterministic row count, so only the plan shape is
 -- checked.
 EXPLAIN (COSTS OFF) SELECT id FROM qft WHERE id > (random() * 1000)::int;
-                            QUERY PLAN                             
--------------------------------------------------------------------
- Foreign Scan on qft
-   Filter: (id > ((random() * '1000'::double precision))::integer)
-   Replicas: 3
-   Remote SQL Template: SELECT id FROM public.qual_t
-(4 rows)
+                               QUERY PLAN                                
+-------------------------------------------------------------------------
+ Append
+   ->  Async Foreign Scan on qft
+         Filter: (id > ((random() * '1000'::double precision))::integer)
+         Replica: 0
+         Replicas: 3
+         Remote SQL Template: SELECT id FROM public.qual_t
+   ->  Async Foreign Scan on qft
+         Filter: (id > ((random() * '1000'::double precision))::integer)
+         Replica: 1
+         Replicas: 3
+         Remote SQL Template: SELECT id FROM public.qual_t
+   ->  Async Foreign Scan on qft
+         Filter: (id > ((random() * '1000'::double precision))::integer)
+         Replica: 2
+         Replicas: 3
+         Remote SQL Template: SELECT id FROM public.qual_t
+(16 rows)
 
 -- 5. IN / IS NULL / OR / NOT all push down, and results are correct.
 EXPLAIN (COSTS OFF) SELECT count(*) FROM qft WHERE id IN (1, 2, 3);
-                                            QUERY PLAN                                             
----------------------------------------------------------------------------------------------------
- Foreign Scan
-   Replicas: 3
-   Remote SQL Template: SELECT count(*) FROM public.qual_t WHERE (id = ANY ('{1,2,3}'::integer[]))
-(3 rows)
+                                                QUERY PLAN                                                 
+-----------------------------------------------------------------------------------------------------------
+ Aggregate
+   ->  Append
+         ->  Async Foreign Scan on qft
+               Replica: 0
+               Replicas: 3
+               Remote SQL Template: SELECT NULL FROM public.qual_t WHERE (id = ANY ('{1,2,3}'::integer[]))
+         ->  Async Foreign Scan on qft
+               Replica: 1
+               Replicas: 3
+               Remote SQL Template: SELECT NULL FROM public.qual_t WHERE (id = ANY ('{1,2,3}'::integer[]))
+         ->  Async Foreign Scan on qft
+               Replica: 2
+               Replicas: 3
+               Remote SQL Template: SELECT NULL FROM public.qual_t WHERE (id = ANY ('{1,2,3}'::integer[]))
+(14 rows)
 
 SELECT count(*) FROM qft WHERE id IN (1, 2, 3);
  count 
@@ -123,12 +180,23 @@ SELECT count(*) FROM qft WHERE id IN (1, 2, 3);
 (1 row)
 
 EXPLAIN (COSTS OFF) SELECT count(*) FROM qft WHERE pad IS NULL;
-                                  QUERY PLAN                                   
--------------------------------------------------------------------------------
- Foreign Scan
-   Replicas: 3
-   Remote SQL Template: SELECT count(*) FROM public.qual_t WHERE (pad IS NULL)
-(3 rows)
+                                      QUERY PLAN                                       
+---------------------------------------------------------------------------------------
+ Aggregate
+   ->  Append
+         ->  Async Foreign Scan on qft
+               Replica: 0
+               Replicas: 3
+               Remote SQL Template: SELECT NULL FROM public.qual_t WHERE (pad IS NULL)
+         ->  Async Foreign Scan on qft
+               Replica: 1
+               Replicas: 3
+               Remote SQL Template: SELECT NULL FROM public.qual_t WHERE (pad IS NULL)
+         ->  Async Foreign Scan on qft
+               Replica: 2
+               Replicas: 3
+               Remote SQL Template: SELECT NULL FROM public.qual_t WHERE (pad IS NULL)
+(14 rows)
 
 SELECT count(*) FROM qft WHERE pad IS NULL;
  count 
@@ -143,12 +211,23 @@ SELECT count(*) FROM qft WHERE pad IS NOT NULL;
 (1 row)
 
 EXPLAIN (COSTS OFF) SELECT count(*) FROM qft WHERE id = 5 OR id = 10;
-                                                  QUERY PLAN                                                   
----------------------------------------------------------------------------------------------------------------
- Foreign Scan
-   Replicas: 3
-   Remote SQL Template: SELECT count(*) FROM public.qual_t WHERE ((id = '5'::integer) OR (id = '10'::integer))
-(3 rows)
+                                                      QUERY PLAN                                                       
+-----------------------------------------------------------------------------------------------------------------------
+ Aggregate
+   ->  Append
+         ->  Async Foreign Scan on qft
+               Replica: 0
+               Replicas: 3
+               Remote SQL Template: SELECT NULL FROM public.qual_t WHERE ((id = '5'::integer) OR (id = '10'::integer))
+         ->  Async Foreign Scan on qft
+               Replica: 1
+               Replicas: 3
+               Remote SQL Template: SELECT NULL FROM public.qual_t WHERE ((id = '5'::integer) OR (id = '10'::integer))
+         ->  Async Foreign Scan on qft
+               Replica: 2
+               Replicas: 3
+               Remote SQL Template: SELECT NULL FROM public.qual_t WHERE ((id = '5'::integer) OR (id = '10'::integer))
+(14 rows)
 
 SELECT count(*) FROM qft WHERE id = 5 OR id = 10;
  count 
@@ -157,12 +236,23 @@ SELECT count(*) FROM qft WHERE id = 5 OR id = 10;
 (1 row)
 
 EXPLAIN (COSTS OFF) SELECT count(*) FROM qft WHERE NOT (id > 100);
-                                       QUERY PLAN                                       
-----------------------------------------------------------------------------------------
- Foreign Scan
-   Replicas: 3
-   Remote SQL Template: SELECT count(*) FROM public.qual_t WHERE (id <= '100'::integer)
-(3 rows)
+                                           QUERY PLAN                                           
+------------------------------------------------------------------------------------------------
+ Aggregate
+   ->  Append
+         ->  Async Foreign Scan on qft
+               Replica: 0
+               Replicas: 3
+               Remote SQL Template: SELECT NULL FROM public.qual_t WHERE (id <= '100'::integer)
+         ->  Async Foreign Scan on qft
+               Replica: 1
+               Replicas: 3
+               Remote SQL Template: SELECT NULL FROM public.qual_t WHERE (id <= '100'::integer)
+         ->  Async Foreign Scan on qft
+               Replica: 2
+               Replicas: 3
+               Remote SQL Template: SELECT NULL FROM public.qual_t WHERE (id <= '100'::integer)
+(14 rows)
 
 SELECT count(*) FROM qft WHERE NOT (id > 100);
  count 
@@ -176,12 +266,22 @@ SELECT count(*) FROM qft WHERE NOT (id > 100);
 CREATE FOREIGN TABLE qft2 (my_id int OPTIONS (column_name 'id'), pad text)
   SERVER qual_srv OPTIONS (table_name 'qual_t', min_blocks_per_slice '1');
 EXPLAIN (COSTS OFF) SELECT my_id FROM qft2 WHERE my_id > 100;
-                                   QUERY PLAN                                    
----------------------------------------------------------------------------------
- Foreign Scan on qft2
-   Replicas: 3
-   Remote SQL Template: SELECT id FROM public.qual_t WHERE (id > '100'::integer)
-(3 rows)
+                                      QUERY PLAN                                       
+---------------------------------------------------------------------------------------
+ Append
+   ->  Async Foreign Scan on qft2
+         Replica: 0
+         Replicas: 3
+         Remote SQL Template: SELECT id FROM public.qual_t WHERE (id > '100'::integer)
+   ->  Async Foreign Scan on qft2
+         Replica: 1
+         Replicas: 3
+         Remote SQL Template: SELECT id FROM public.qual_t WHERE (id > '100'::integer)
+   ->  Async Foreign Scan on qft2
+         Replica: 2
+         Replicas: 3
+         Remote SQL Template: SELECT id FROM public.qual_t WHERE (id > '100'::integer)
+(13 rows)
 
 SELECT count(*) FROM qft2 WHERE my_id > 100;
  count 
@@ -195,12 +295,23 @@ SELECT count(*) FROM qft2 WHERE my_id > 100;
 -- (<pred>) AND ctid ...", and RepFdwNextCountTuple sums the partials
 -- unchanged.
 EXPLAIN (COSTS OFF) SELECT count(*) FROM qft WHERE id > 100;
-                                      QUERY PLAN                                       
----------------------------------------------------------------------------------------
- Foreign Scan
-   Replicas: 3
-   Remote SQL Template: SELECT count(*) FROM public.qual_t WHERE (id > '100'::integer)
-(3 rows)
+                                          QUERY PLAN                                           
+-----------------------------------------------------------------------------------------------
+ Aggregate
+   ->  Append
+         ->  Async Foreign Scan on qft
+               Replica: 0
+               Replicas: 3
+               Remote SQL Template: SELECT NULL FROM public.qual_t WHERE (id > '100'::integer)
+         ->  Async Foreign Scan on qft
+               Replica: 1
+               Replicas: 3
+               Remote SQL Template: SELECT NULL FROM public.qual_t WHERE (id > '100'::integer)
+         ->  Async Foreign Scan on qft
+               Replica: 2
+               Replicas: 3
+               Remote SQL Template: SELECT NULL FROM public.qual_t WHERE (id > '100'::integer)
+(14 rows)
 
 SELECT count(*) FROM qft WHERE id > 100;
  count 
@@ -213,10 +324,21 @@ SELECT count(*) FROM qft WHERE id > 100;
 -- flaky (same reason as test/sql/count_pushdown.sql / invalidation.sql).
 EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF)
   SELECT count(*) FROM qft WHERE id > 100;
-                                      QUERY PLAN                                       
----------------------------------------------------------------------------------------
- Foreign Scan (actual rows=1.00 loops=1)
-   Replicas: 3
-   Remote SQL Template: SELECT count(*) FROM public.qual_t WHERE (id > '100'::integer)
-(3 rows)
+                                          QUERY PLAN                                           
+-----------------------------------------------------------------------------------------------
+ Aggregate (actual rows=1.00 loops=1)
+   ->  Append (actual rows=300.00 loops=1)
+         ->  Async Foreign Scan on qft (actual rows=28.00 loops=1)
+               Replica: 0
+               Replicas: 3
+               Remote SQL Template: SELECT NULL FROM public.qual_t WHERE (id > '100'::integer)
+         ->  Async Foreign Scan on qft (actual rows=136.00 loops=1)
+               Replica: 1
+               Replicas: 3
+               Remote SQL Template: SELECT NULL FROM public.qual_t WHERE (id > '100'::integer)
+         ->  Async Foreign Scan on qft (actual rows=136.00 loops=1)
+               Replica: 2
+               Replicas: 3
+               Remote SQL Template: SELECT NULL FROM public.qual_t WHERE (id > '100'::integer)
+(14 rows)
 

@@ -503,7 +503,7 @@ repfdwGetForeignPlan(PlannerInfo *root, RelOptInfo *baserel,
 static void
 repfdw_run_slice_query(RepFdwScanState *fsstate)
 {
-	ReplicaConn *rconn = &fsstate->rset->conns[fsstate->my_index];
+	ReplicaConn *rconn = fsstate->rconn;
 	RepFdwCtidBound *bounds;
 	BlockNumber nblocks;
 	int			P;
@@ -539,7 +539,7 @@ repfdw_run_slice_query(RepFdwScanState *fsstate)
 static bool
 repfdw_store_next_row(RepFdwScanState *fsstate, TupleTableSlot *slot)
 {
-	ReplicaConn *rconn = &fsstate->rset->conns[fsstate->my_index];
+	ReplicaConn *rconn = fsstate->rconn;
 	PGresult   *res;
 	HeapTuple	tuple;
 	char	  **values;
@@ -637,6 +637,14 @@ repfdwBeginForeignScan(ForeignScanState *node, int eflags)
 	fsstate->rset = RepFdwGetConnections(user, opts);
 	RepFdwBeginRemoteXact(fsstate->rset);
 
+	/*
+	 * Claim this child's own connection to its replica.  Two concurrently live
+	 * scans of the same server (e.g. a self-join) get distinct connections
+	 * (cached primary + overflow), so they no longer collide on one socket.
+	 */
+	fsstate->rconn = RepFdwCheckoutConn(fsstate->rset, opts, user,
+										fsstate->my_index);
+
 	fsstate->attinmeta =
 		TupleDescGetAttInMetadata(RelationGetDescr(node->ss.ss_currentRelation));
 	fsstate->batch_cxt = AllocSetContextCreate(CurrentMemoryContext,
@@ -671,7 +679,7 @@ repfdwIterateForeignScan(ForeignScanState *node)
 		return slot;
 	}
 
-	rconn = &fsstate->rset->conns[fsstate->my_index];
+	rconn = fsstate->rconn;
 
 	for (;;)
 	{
@@ -712,7 +720,7 @@ repfdwReScanForeignScan(ForeignScanState *node)
 		return;
 
 	if (fsstate->my_started)
-		RepFdwCancelDrainOne(&fsstate->rset->conns[fsstate->my_index]);
+		RepFdwCancelDrainOne(fsstate->rconn);
 
 	repfdw_run_slice_query(fsstate);
 }
@@ -731,8 +739,9 @@ repfdwEndForeignScan(ForeignScanState *node)
 	if (fsstate == NULL)
 		return;
 
-	if (fsstate->my_started)
-		RepFdwCancelDrainOne(&fsstate->rset->conns[fsstate->my_index]);
+	/* Release our checked-out connection (drains any in-flight query). */
+	if (fsstate->rconn != NULL)
+		RepFdwReturnConn(fsstate->rconn);
 
 	if (fsstate->batch_cxt)
 		MemoryContextDelete(fsstate->batch_cxt);
@@ -776,7 +785,7 @@ repfdw_async_produce(AsyncRequest *areq)
 		return;
 	}
 
-	rconn = &fsstate->rset->conns[fsstate->my_index];
+	rconn = fsstate->rconn;
 
 	/*
 	 * A row is buffered: let the node's normal ExecProcNode path pull it
@@ -827,7 +836,7 @@ repfdwForeignAsyncConfigureWait(AsyncRequest *areq)
 	RepFdwScanState *fsstate = (RepFdwScanState *) node->fdw_state;
 	AppendState *requestor = (AppendState *) areq->requestor;
 	WaitEventSet *set = requestor->as_eventset;
-	ReplicaConn *rconn = &fsstate->rset->conns[fsstate->my_index];
+	ReplicaConn *rconn = fsstate->rconn;
 
 	Assert(areq->callback_pending);
 
@@ -845,7 +854,7 @@ repfdwForeignAsyncNotify(AsyncRequest *areq)
 {
 	ForeignScanState *node = (ForeignScanState *) areq->requestee;
 	RepFdwScanState *fsstate = (RepFdwScanState *) node->fdw_state;
-	ReplicaConn *rconn = &fsstate->rset->conns[fsstate->my_index];
+	ReplicaConn *rconn = fsstate->rconn;
 
 	Assert(!areq->callback_pending);
 

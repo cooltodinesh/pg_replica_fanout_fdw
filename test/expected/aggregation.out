@@ -1,0 +1,148 @@
+-- aggregation.sql (v2): aggregation is handled by native PostgreSQL Agg nodes
+-- stacked on the Append of per-replica Async Foreign Scans -- not by any
+-- internal combine.  This is the v2 architecture (notes/v2-append-architecture.md):
+-- each replica streams its own ctid slice concurrently, and core aggregates the
+-- union.  GROUP BY / avg / etc. therefore work for free, unlike v1.
+--
+-- Checks are discriminating: a broken slice map would make the counts wrong, and
+-- a stale/1-slice plan would show fewer than 3 Async Foreign Scan children.
+\i test/loopback-setup.sql
+-- test/loopback-setup.sql
+--
+-- Shared setup for the loopback regress suites: point all three "replicas"
+-- at the same local instance.  Disjoint ctid slices still union to exactly
+-- the whole table, so slicing/fan-out/merge are fully exercised on one
+-- instance.  Idempotent, safe to \i at the top of any suite.
+-- Idempotent by design (IF NOT EXISTS throughout, no DROP/CASCADE): this
+-- file is \i'd at the top of every suite, and suites run sequentially
+-- against the same regression database.
+CREATE EXTENSION IF NOT EXISTS pg_replica_fanout_fdw;
+psql:test/loopback-setup.sql:10: NOTICE:  extension "pg_replica_fanout_fdw" already exists, skipping
+CREATE SERVER IF NOT EXISTS loopback FOREIGN DATA WRAPPER pg_replica_fanout_fdw
+  OPTIONS (replicas 'localhost:5432,localhost:5432,localhost:5432',
+           consistency 'none');
+psql:test/loopback-setup.sql:14: NOTICE:  server "loopback" already exists, skipping
+CREATE USER MAPPING IF NOT EXISTS FOR CURRENT_USER SERVER loopback;
+psql:test/loopback-setup.sql:16: NOTICE:  user mapping for "user" already exists for server "loopback", skipping
+-- Multi-block table so the 3 slices are non-trivial (nblocks >> 3).
+CREATE TABLE agg_t (id int, grp int, pad text);
+INSERT INTO agg_t SELECT g, g % 4, repeat('q', 900) FROM generate_series(1, 400) g;
+DROP SERVER IF EXISTS agg_srv CASCADE;
+NOTICE:  server "agg_srv" does not exist, skipping
+CREATE SERVER agg_srv FOREIGN DATA WRAPPER pg_replica_fanout_fdw
+  OPTIONS (replicas 'localhost:5432,localhost:5432,localhost:5432',
+           consistency 'none');
+CREATE USER MAPPING FOR CURRENT_USER SERVER agg_srv;
+CREATE FOREIGN TABLE aft (id int, grp int, pad text)
+  SERVER agg_srv OPTIONS (table_name 'agg_t', min_blocks_per_slice '1');
+-- 1. Whole-table aggregates: native Agg over the Append, correct answers.
+SELECT count(*), sum(id), min(id), max(id), avg(id)::numeric(10,4) FROM aft;
+ count |  sum  | min | max |   avg    
+-------+-------+-----+-----+----------
+   400 | 80200 |   1 | 400 | 200.5000
+(1 row)
+
+-- The plan: a native Aggregate over an Append of 3 Async Foreign Scans; no
+-- internal combine, no per-aggregate FDW code.
+EXPLAIN (COSTS OFF) SELECT count(*) FROM aft;
+                            QUERY PLAN                            
+------------------------------------------------------------------
+ Aggregate
+   ->  Append
+         ->  Async Foreign Scan on aft
+               Replica: 0
+               Replicas: 3
+               Remote SQL Template: SELECT NULL FROM public.agg_t
+         ->  Async Foreign Scan on aft
+               Replica: 1
+               Replicas: 3
+               Remote SQL Template: SELECT NULL FROM public.agg_t
+         ->  Async Foreign Scan on aft
+               Replica: 2
+               Replicas: 3
+               Remote SQL Template: SELECT NULL FROM public.agg_t
+(14 rows)
+
+-- 2. The 3 slices actually ran and are disjoint+complete: under ANALYZE the
+-- child "actual rows" sum to the full row count, and there are 3 of them.
+-- (BUFFERS OFF: PG18+ ANALYZE buffers accounting is noisy.)
+EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF)
+  SELECT count(*) FROM aft;
+                             QUERY PLAN                             
+--------------------------------------------------------------------
+ Aggregate (actual rows=1.00 loops=1)
+   ->  Append (actual rows=400.00 loops=1)
+         ->  Async Foreign Scan on aft (actual rows=128.00 loops=1)
+               Replica: 0
+               Replicas: 3
+               Remote SQL Template: SELECT NULL FROM public.agg_t
+         ->  Async Foreign Scan on aft (actual rows=136.00 loops=1)
+               Replica: 1
+               Replicas: 3
+               Remote SQL Template: SELECT NULL FROM public.agg_t
+         ->  Async Foreign Scan on aft (actual rows=136.00 loops=1)
+               Replica: 2
+               Replicas: 3
+               Remote SQL Template: SELECT NULL FROM public.agg_t
+(14 rows)
+
+-- 3. GROUP BY -- works natively in v2 (impossible to push in v1).
+SELECT grp, count(*), sum(id) FROM aft GROUP BY grp ORDER BY grp;
+ grp | count |  sum  
+-----+-------+-------
+   0 |   100 | 20200
+   1 |   100 | 19900
+   2 |   100 | 20000
+   3 |   100 | 20100
+(4 rows)
+
+-- 4. Aggregate with a WHERE: the shippable qual is pushed into each replica's
+-- per-slice query (see qual_pushdown), then core aggregates the survivors.
+SELECT count(*), min(id), max(id) FROM aft WHERE id > 100;
+ count | min | max 
+-------+-----+-----
+   300 | 101 | 400
+(1 row)
+
+EXPLAIN (COSTS OFF) SELECT count(*) FROM aft WHERE id > 100;
+                                          QUERY PLAN                                          
+----------------------------------------------------------------------------------------------
+ Aggregate
+   ->  Append
+         ->  Async Foreign Scan on aft
+               Replica: 0
+               Replicas: 3
+               Remote SQL Template: SELECT NULL FROM public.agg_t WHERE (id > '100'::integer)
+         ->  Async Foreign Scan on aft
+               Replica: 1
+               Replicas: 3
+               Remote SQL Template: SELECT NULL FROM public.agg_t WHERE (id > '100'::integer)
+         ->  Async Foreign Scan on aft
+               Replica: 2
+               Replicas: 3
+               Remote SQL Template: SELECT NULL FROM public.agg_t WHERE (id > '100'::integer)
+(14 rows)
+
+-- 5. Reuse across plan shapes in one session: aggregate, then a plain scan.
+SELECT count(*) FROM aft;
+ count 
+-------
+   400
+(1 row)
+
+SELECT id FROM aft ORDER BY id LIMIT 3;
+ id 
+----
+  1
+  2
+  3
+(3 rows)
+
+-- 6. Self-aggregation via join (exercises overflow connections: two concurrent
+-- scans of the same server).
+SELECT count(*) FROM aft a JOIN aft b USING (id);
+ count 
+-------
+   400
+(1 row)
+

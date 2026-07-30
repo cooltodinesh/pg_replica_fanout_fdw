@@ -13,9 +13,11 @@ SELECT * FROM small_ft
 EXCEPT
 SELECT * FROM small_t;
 
--- two concurrently-live foreign scans on the same server (self-join) must
--- raise a clear error, not a bare libpq "another command is already in
--- progress" message.
+-- two concurrently-live foreign scans on the same server (self-join) are
+-- supported: in the v2 Append-of-per-replica-scans model each scan node checks
+-- out its own connection to each replica (a cached primary, plus overflow
+-- connections for the second concurrent scan), so they no longer collide on a
+-- single socket.
 SELECT count(*) FROM small_ft a JOIN small_ft b USING (id);
 
 -- a single scan node, rescanned many times (correlated subquery), remains

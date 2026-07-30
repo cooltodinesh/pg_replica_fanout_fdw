@@ -75,13 +75,14 @@ typedef enum RepConnState
 typedef struct ReplicaConn
 {
 	PGconn	   *conn;
-	int			index;			/* replica index = slice index when active */
+	int			index;			/* replica index this conn talks to */
 	char	   *host;
 	int			port;
 	RepConnState state;
 	List	   *rowqueue;		/* queued PGresult chunks (PGRES_TUPLES_CHUNK) */
 	int			cur_row;		/* cursor within linitial(rowqueue) */
 	bool		paused;			/* backpressure: temporarily not polled */
+	bool		in_use;			/* checked out by a live scan node (v2) */
 } ReplicaConn;
 
 struct RepFdwScanState;
@@ -91,11 +92,13 @@ typedef struct ReplicaSet
 {
 	Oid			umid;			/* hash key, must be first */
 	int			nconns;
-	ReplicaConn *conns;			/* array[nconns] */
+	ReplicaConn *conns;			/* array[nconns]: the cached "primary" conn per
+								 * replica, reused across statements */
+	List	   *overflow_conns; /* extra ReplicaConn * created when a replica's
+								 * primary is already in use by a concurrently
+								 * live scan (e.g. a self-join); torn down at
+								 * local xact end (v2) */
 	bool		xact_open;		/* remote REPEATABLE READ READ ONLY open on all */
-	struct RepFdwScanState *active_scan;	/* non-NULL => a scan owns these
-											 * conns; only one live scan per
-											 * server is supported */
 	uint32		server_hashvalue;	/* GetSysCacheHashValue1(FOREIGNSERVEROID) */
 	uint32		mapping_hashvalue;	/* GetSysCacheHashValue1(USERMAPPINGOID) */
 	bool		invalidated;	/* an ALTER touched this server/mapping;
@@ -162,6 +165,7 @@ typedef struct RepFdwScanState
 	 */
 	int			my_index;		/* this node's replica/slice index */
 	int			nreplicas;		/* total replicas = Append child count */
+	ReplicaConn *rconn;			/* this node's checked-out connection */
 	bool		my_active;		/* false when my_index >= P (no slice) */
 	bool		my_started;		/* streaming query has been sent */
 } RepFdwScanState;
@@ -173,6 +177,9 @@ extern List *RepFdwParseReplicas(const char *replicas_str);
 /* in connection.c */
 extern ReplicaSet *RepFdwGetConnections(UserMapping *user, RepFdwOptions *opts);
 extern void RepFdwBeginRemoteXact(ReplicaSet *rset);
+extern ReplicaConn *RepFdwCheckoutConn(ReplicaSet *rset, RepFdwOptions *opts,
+									   UserMapping *user, int index);
+extern void RepFdwReturnConn(ReplicaConn *rconn);
 extern void RepFdwStartQueries(ReplicaSet *rset, int nactive, char **sqls,
 								RepFdwCtidBound *bounds, int fetch_size);
 extern void RepStreamPump(struct RepFdwScanState *fsstate);

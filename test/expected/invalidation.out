@@ -55,9 +55,10 @@ EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF) SELECT * FROM
                        QUERY PLAN                        
 ---------------------------------------------------------
  Foreign Scan on inv_ft (actual rows=400.00 loops=1)
+   Replica: 0
    Replicas: 1
    Remote SQL Template: SELECT id, pad FROM public.inv_t
-(3 rows)
+(4 rows)
 
 -- Widen the replica list: the cached ReplicaSet must be rebuilt.  If it is,
 -- nslices (and thus "Replicas:") goes 1 -> 3; a stale cache would stay at 1.
@@ -69,12 +70,22 @@ SELECT count(*) FROM inv_ft;
 (1 row)
 
 EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF) SELECT * FROM inv_ft;
-                       QUERY PLAN                        
----------------------------------------------------------
- Foreign Scan on inv_ft (actual rows=400.00 loops=1)
-   Replicas: 3
-   Remote SQL Template: SELECT id, pad FROM public.inv_t
-(3 rows)
+                           QUERY PLAN                            
+-----------------------------------------------------------------
+ Append (actual rows=400.00 loops=1)
+   ->  Async Foreign Scan on inv_ft (actual rows=128.00 loops=1)
+         Replica: 0
+         Replicas: 3
+         Remote SQL Template: SELECT id, pad FROM public.inv_t
+   ->  Async Foreign Scan on inv_ft (actual rows=136.00 loops=1)
+         Replica: 1
+         Replicas: 3
+         Remote SQL Template: SELECT id, pad FROM public.inv_t
+   ->  Async Foreign Scan on inv_ft (actual rows=136.00 loops=1)
+         Replica: 2
+         Replicas: 3
+         Remote SQL Template: SELECT id, pad FROM public.inv_t
+(13 rows)
 
 -- ALTER USER MAPPING must also rebuild the connections.  Point the mapping at
 -- a role that cannot read the base table.

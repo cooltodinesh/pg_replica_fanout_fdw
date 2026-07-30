@@ -1,6 +1,6 @@
 -- qual_pushdown.sql: shippable top-level AND conjuncts of a WHERE clause are
--- pushed into each replica's per-slice query; everything else stays a local
--- Filter above the (uncombined) Foreign Scan.
+-- pushed into each replica's per-slice query (each Append child's remote SQL);
+-- everything else stays a local Filter on the Async Foreign Scan.
 --
 -- The governing rule: N replicas each evaluate the pushed predicate
 -- independently against their own ctid slice, so the fan-out answer equals
@@ -8,7 +8,7 @@
 -- than postgres_fdw, which ships STABLE functions (e.g. now()) freely -- we
 -- must not, since replicas' clocks and snapshots can differ.  Checks below
 -- are deliberately *discriminating*, in the same style as
--- test/sql/count_pushdown.sql.
+-- test/sql/aggregation.sql.
 \i test/loopback-setup.sql
 
 -- Multi-block table so that, with min_blocks_per_slice=1, nslices tracks
