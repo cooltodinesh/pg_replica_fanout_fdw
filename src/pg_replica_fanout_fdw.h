@@ -154,15 +154,16 @@ typedef struct RepFdwScanState
 	/*
 	 * v2 (M0) per-replica scan state.  In the v2 architecture each replica's
 	 * slice is a separate ForeignScan node under an Append (see
-	 * notes/v2-append-architecture.md); this node owns exactly one replica.
-	 * M0 is deliberately synchronous: my_res holds the whole slice result
-	 * (blocking exec) and my_row walks it.  Async streaming is M0b.
+	 * notes/v2-append-architecture.md); this node owns exactly one replica's
+	 * connection (rset->conns[my_index]) and streams it in chunked-rows mode.
+	 * An async-capable Append (M0b) drives all N children's sockets
+	 * concurrently via the ForeignAsync* callbacks; the same streaming state
+	 * feeds the synchronous IterateForeignScan fallback.
 	 */
 	int			my_index;		/* this node's replica/slice index */
 	int			nreplicas;		/* total replicas = Append child count */
-	PGresult   *my_res;			/* this slice's full result, or NULL if idle */
-	int			my_row;			/* cursor within my_res */
 	bool		my_active;		/* false when my_index >= P (no slice) */
+	bool		my_started;		/* streaming query has been sent */
 } RepFdwScanState;
 
 /* in option.c */
@@ -177,6 +178,11 @@ extern void RepFdwStartQueries(ReplicaSet *rset, int nactive, char **sqls,
 extern void RepStreamPump(struct RepFdwScanState *fsstate);
 extern int	RepFdwQueuedRowCount(ReplicaConn *rconn);
 extern void RepFdwCancelAndDrain(ReplicaSet *rset, int nactive);
+extern void RepFdwStartOneQuery(ReplicaConn *rconn, const char *sql,
+								const RepFdwCtidBound *bound, int fetch_size);
+extern void RepFdwDrainConn(ReplicaConn *rconn, int fetch_size);
+extern void RepFdwPumpOne(ReplicaConn *rconn, int fetch_size);
+extern void RepFdwCancelDrainOne(ReplicaConn *rconn);
 extern PGresult *RepFdwExecSync(ReplicaConn *rconn, const char *sql);
 extern PGresult *RepFdwExecBounded(ReplicaConn *rconn, const char *sql,
 								   const RepFdwCtidBound *bound);

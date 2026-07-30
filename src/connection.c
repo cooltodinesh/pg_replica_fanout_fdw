@@ -771,6 +771,155 @@ RepStreamPump(RepFdwScanState *fsstate)
 }
 
 /*
+ * RepFdwStartOneQuery
+ *		Send one ctid-bounded slice query on a single replica connection in
+ *		chunked-rows streaming mode (v2 async path -- each Append child owns
+ *		one connection and drives it independently).
+ */
+void
+RepFdwStartOneQuery(ReplicaConn *rconn, const char *sql,
+					const RepFdwCtidBound *bound, int fetch_size)
+{
+	Oid			paramTypes[2];
+	const char *paramValues[2];
+	int			nparams = 0;
+
+	if (bound->lo != NULL)
+	{
+		paramTypes[nparams] = TIDOID;
+		paramValues[nparams] = bound->lo;
+		nparams++;
+	}
+	if (bound->hi != NULL)
+	{
+		paramTypes[nparams] = TIDOID;
+		paramValues[nparams] = bound->hi;
+		nparams++;
+	}
+
+	if (!PQsendQueryParams(rconn->conn, sql, nparams, paramTypes,
+						   paramValues, NULL, NULL, 0))
+		RepFdwReportError(NULL, rconn, sql);
+
+	if (PQsetChunkedRowsMode(rconn->conn, fetch_size) != 1)
+		ereport(ERROR,
+				(errcode(ERRCODE_CONNECTION_EXCEPTION),
+				 errmsg("could not enable chunked rows mode for replica \"%s:%d\"",
+						rconn->host, rconn->port)));
+
+	rconn->state = REP_STREAMING;
+	rconn->rowqueue = NIL;
+	rconn->cur_row = 0;
+	rconn->paused = false;
+}
+
+/*
+ * RepFdwDrainConn
+ *		Non-blocking: consume whatever input is already available on one
+ *		connection, queueing chunks and detecting completion.  Used by the
+ *		async ForeignAsyncNotify callback after the socket signals readable.
+ */
+void
+RepFdwDrainConn(ReplicaConn *rconn, int fetch_size)
+{
+	drain_conn(rconn, fetch_size);
+}
+
+/*
+ * RepFdwPumpOne
+ *		Blocking (but interruptible): wait on one connection's socket and drain
+ *		until it makes progress (gains a queued row or finishes).  The
+ *		synchronous fallback for the async streaming path -- used by
+ *		IterateForeignScan when a child is executed outside an async Append.
+ */
+void
+RepFdwPumpOne(ReplicaConn *rconn, int fetch_size)
+{
+	while (rconn->state == REP_STREAMING)
+	{
+		WaitEventSet *wes;
+		WaitEvent	occurred[REP_MAX_WAIT_EVENTS];
+		int			noccurred;
+		int			i;
+		int			before_rows = RepFdwQueuedRowCount(rconn);
+		RepConnState before_state = rconn->state;
+
+		wes = CreateWaitEventSet(CurrentResourceOwner, 3);
+		AddWaitEventToSet(wes, WL_EXIT_ON_PM_DEATH, PGINVALID_SOCKET, NULL, NULL);
+		AddWaitEventToSet(wes, WL_LATCH_SET, PGINVALID_SOCKET, MyLatch, NULL);
+		AddWaitEventToSet(wes, WL_SOCKET_READABLE, PQsocket(rconn->conn),
+						  NULL, rconn);
+
+		noccurred = WaitEventSetWait(wes, -1, occurred, REP_MAX_WAIT_EVENTS,
+									 we_stream);
+
+		for (i = 0; i < noccurred; i++)
+		{
+			if (occurred[i].events & WL_LATCH_SET)
+			{
+				ResetLatch(MyLatch);
+				CHECK_FOR_INTERRUPTS();
+			}
+			if (occurred[i].events & WL_SOCKET_READABLE)
+				drain_conn(rconn, fetch_size);
+		}
+
+		FreeWaitEventSet(wes);
+
+		if (rconn->state != before_state ||
+			RepFdwQueuedRowCount(rconn) != before_rows)
+			return;
+	}
+}
+
+/*
+ * RepFdwCancelDrainOne
+ *		Cancel any in-flight query on one connection and drain it back to
+ *		idle-in-transaction.  Single-connection form of RepFdwCancelAndDrain,
+ *		used by the v2 per-child ReScan/End.
+ */
+void
+RepFdwCancelDrainOne(ReplicaConn *rconn)
+{
+	TimestampTz endtime = TimestampTzPlusMilliseconds(GetCurrentTimestamp(), 5000);
+	ListCell   *lc;
+
+	if (rconn->conn == NULL)
+		return;
+
+	if (rconn->state == REP_STREAMING)
+	{
+		const char *err = libpqsrv_cancel(rconn->conn, endtime);
+
+		if (err != NULL)
+			ereport(WARNING,
+					(errmsg("could not cancel query on replica \"%s:%d\": %s",
+							rconn->host, rconn->port, err)));
+
+		for (;;)
+		{
+			PGresult   *res = libpqsrv_get_result(rconn->conn, we_stream);
+
+			if (res == NULL)
+				break;
+			if (PQresultStatus(res) == PGRES_TUPLES_OK)
+				rconn->state = REP_DONE;
+			PQclear(res);
+		}
+		rconn->state = REP_DONE;
+	}
+
+	foreach(lc, rconn->rowqueue)
+		PQclear((PGresult *) lfirst(lc));
+	list_free(rconn->rowqueue);
+	rconn->rowqueue = NIL;
+	rconn->cur_row = 0;
+	rconn->paused = false;
+	if (rconn->state != REP_DEAD)
+		rconn->state = REP_IN_TXN;
+}
+
+/*
  * RepFdwCancelAndDrain
  *		Cancel any in-flight query on the first nactive replicas and drain
  *		results so the connections go back to idle-in-transaction.  Used by

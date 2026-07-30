@@ -16,6 +16,7 @@
 #include "access/tupdesc.h"
 #include "commands/explain_format.h"
 #include "commands/explain_state.h"
+#include "executor/execAsync.h"
 #include "executor/tuptable.h"
 #include "foreign/fdwapi.h"
 #include "foreign/foreign.h"
@@ -65,6 +66,10 @@ static void repfdwGetForeignUpperPaths(PlannerInfo *root,
 										RelOptInfo *input_rel,
 										RelOptInfo *output_rel,
 										void *extra);
+static bool repfdwIsForeignPathAsyncCapable(ForeignPath *path);
+static void repfdwForeignAsyncRequest(AsyncRequest *areq);
+static void repfdwForeignAsyncConfigureWait(AsyncRequest *areq);
+static void repfdwForeignAsyncNotify(AsyncRequest *areq);
 
 Datum
 pg_replica_fanout_fdw_handler(PG_FUNCTION_ARGS)
@@ -81,6 +86,12 @@ pg_replica_fanout_fdw_handler(PG_FUNCTION_ARGS)
 	routine->ExplainForeignScan = repfdwExplainForeignScan;
 	routine->IsForeignScanParallelSafe = repfdwIsForeignScanParallelSafe;
 	routine->GetForeignUpperPaths = repfdwGetForeignUpperPaths;
+
+	/* v2 (M0b): async execution -- the Append drives all replicas at once. */
+	routine->IsForeignPathAsyncCapable = repfdwIsForeignPathAsyncCapable;
+	routine->ForeignAsyncRequest = repfdwForeignAsyncRequest;
+	routine->ForeignAsyncConfigureWait = repfdwForeignAsyncConfigureWait;
+	routine->ForeignAsyncNotify = repfdwForeignAsyncNotify;
 
 	PG_RETURN_POINTER(routine);
 }
@@ -481,12 +492,13 @@ repfdwGetForeignPlan(PlannerInfo *root, RelOptInfo *baserel,
 
 /*
  * repfdw_run_slice_query
- *		Issue this Append child's slice query on its own replica connection and
- *		buffer the whole result (v2 M0 synchronous path).  Discovers nblocks
+ *		Kick off this Append child's slice query on its own replica connection
+ *		in chunked-rows streaming mode (non-blocking send).  Discovers nblocks
  *		from this node's replica, computes the P disjoint slices, and -- if
- *		this node's index is within P -- runs "SELECT ... WHERE <ctid slice>".
+ *		this node's index is within P -- sends "SELECT ... WHERE <ctid slice>".
  *		A node whose index is >= P (fewer blocks than replicas) is idle and
- *		returns no rows.
+ *		returns no rows.  The rows are drained later, concurrently across all
+ *		children, by the async Append (or by RepFdwPumpOne in the sync path).
  */
 static void
 repfdw_run_slice_query(RepFdwScanState *fsstate)
@@ -505,16 +517,74 @@ repfdw_run_slice_query(RepFdwScanState *fsstate)
 	if (fsstate->my_index >= P)
 	{
 		fsstate->my_active = false;
-		fsstate->my_res = NULL;
-		fsstate->my_row = 0;
+		fsstate->my_started = false;
 		return;
 	}
 
 	sql = RepFdwBuildBoundedSql(fsstate->sql_template, fsstate->remote_pred,
 							   &bounds[fsstate->my_index]);
-	fsstate->my_res = RepFdwExecBounded(rconn, sql, &bounds[fsstate->my_index]);
-	fsstate->my_row = 0;
+	RepFdwStartOneQuery(rconn, sql, &bounds[fsstate->my_index],
+						fsstate->fetch_size);
 	fsstate->my_active = true;
+	fsstate->my_started = true;
+}
+
+/*
+ * repfdw_store_next_row
+ *		If a row is buffered for this child, materialize it into slot and
+ *		return true; otherwise return false (caller must drain more input or
+ *		conclude EOF).  Shared by the sync IterateForeignScan and the async
+ *		callbacks.
+ */
+static bool
+repfdw_store_next_row(RepFdwScanState *fsstate, TupleTableSlot *slot)
+{
+	ReplicaConn *rconn = &fsstate->rset->conns[fsstate->my_index];
+	PGresult   *res;
+	HeapTuple	tuple;
+	char	  **values;
+	int			natts;
+	int			j;
+	ListCell   *lc;
+	MemoryContext oldcxt;
+
+	if (rconn->rowqueue == NIL)
+		return false;
+
+	res = (PGresult *) linitial(rconn->rowqueue);
+	natts = fsstate->attinmeta->tupdesc->natts;
+
+	MemoryContextReset(fsstate->row_cxt);
+	oldcxt = MemoryContextSwitchTo(fsstate->row_cxt);
+
+	values = (char **) palloc0(sizeof(char *) * natts);
+	j = 0;
+	foreach(lc, fsstate->retrieved_attrs)
+	{
+		int			attnum = lfirst_int(lc);
+
+		if (!PQgetisnull(res, rconn->cur_row, j))
+			values[attnum - 1] = PQgetvalue(res, rconn->cur_row, j);
+		j++;
+	}
+	tuple = BuildTupleFromCStrings(fsstate->attinmeta, values);
+
+	MemoryContextSwitchTo(oldcxt);
+
+	rconn->cur_row++;
+	if (rconn->cur_row >= PQntuples(res))
+	{
+		rconn->rowqueue = list_delete_first(rconn->rowqueue);
+		PQclear(res);
+		rconn->cur_row = 0;
+
+		if (rconn->paused &&
+			RepFdwQueuedRowCount(rconn) <= fsstate->fetch_size)
+			rconn->paused = false;
+	}
+
+	ExecStoreHeapTuple(tuple, slot, false);
+	return true;
 }
 
 /*
@@ -569,6 +639,9 @@ repfdwBeginForeignScan(ForeignScanState *node, int eflags)
 
 	fsstate->attinmeta =
 		TupleDescGetAttInMetadata(RelationGetDescr(node->ss.ss_currentRelation));
+	fsstate->batch_cxt = AllocSetContextCreate(CurrentMemoryContext,
+											   "pg_replica_fanout_fdw batch",
+											   ALLOCSET_DEFAULT_SIZES);
 	fsstate->row_cxt = AllocSetContextCreate(CurrentMemoryContext,
 											 "pg_replica_fanout_fdw row",
 											 ALLOCSET_SMALL_SIZES);
@@ -579,59 +652,56 @@ repfdwBeginForeignScan(ForeignScanState *node, int eflags)
 }
 
 /*
- * repfdwIterateForeignScan (v2 -- M0)
- *		Return the next buffered row from this node's slice result, materializing
- *		it through attinmeta (retrieved_attrs maps result columns to attnums).
+ * repfdwIterateForeignScan (v2 -- M0b, synchronous fallback)
+ *		Return the next row from this child's stream, blocking on its socket as
+ *		needed (RepFdwPumpOne).  Used when the scan runs outside an async Append
+ *		(e.g. EvalPlanQual); under an async Append the ForeignAsync* callbacks
+ *		drive tuple production instead.
  */
 static TupleTableSlot *
 repfdwIterateForeignScan(ForeignScanState *node)
 {
 	RepFdwScanState *fsstate = (RepFdwScanState *) node->fdw_state;
 	TupleTableSlot *slot = node->ss.ss_ScanTupleSlot;
-	PGresult   *res = fsstate->my_res;
-	HeapTuple	tuple;
-	char	  **values;
-	int			natts;
-	int			j;
-	ListCell   *lc;
-	MemoryContext oldcxt;
+	ReplicaConn *rconn;
 
-	if (!fsstate->my_active || res == NULL ||
-		fsstate->my_row >= PQntuples(res))
+	if (!fsstate->my_active)
 	{
 		ExecClearTuple(slot);
 		return slot;
 	}
 
-	natts = fsstate->attinmeta->tupdesc->natts;
+	rconn = &fsstate->rset->conns[fsstate->my_index];
 
-	MemoryContextReset(fsstate->row_cxt);
-	oldcxt = MemoryContextSwitchTo(fsstate->row_cxt);
-
-	values = (char **) palloc0(sizeof(char *) * natts);
-	j = 0;
-	foreach(lc, fsstate->retrieved_attrs)
+	for (;;)
 	{
-		int			attnum = lfirst_int(lc);
+		if (repfdw_store_next_row(fsstate, slot))
+			return slot;
 
-		if (!PQgetisnull(res, fsstate->my_row, j))
-			values[attnum - 1] = PQgetvalue(res, fsstate->my_row, j);
-		j++;
+		if (rconn->state != REP_STREAMING)
+		{
+			/* stream finished and nothing left buffered: EOF */
+			ExecClearTuple(slot);
+			return slot;
+		}
+
+		/*
+		 * Drain into batch_cxt: the queued PGresult list cells must outlive
+		 * ExecScan's per-tuple context, which is reset between tuples.
+		 */
+		{
+			MemoryContext oldcxt = MemoryContextSwitchTo(fsstate->batch_cxt);
+
+			RepFdwPumpOne(rconn, fsstate->fetch_size);
+			MemoryContextSwitchTo(oldcxt);
+		}
 	}
-	tuple = BuildTupleFromCStrings(fsstate->attinmeta, values);
-
-	MemoryContextSwitchTo(oldcxt);
-
-	fsstate->my_row++;
-	ExecStoreHeapTuple(tuple, slot, false);
-	return slot;
 }
 
 /*
- * repfdwReScanForeignScan (v2 -- M0)
- *		Re-run this node's slice query.  The blocking exec left the connection
- *		idle-in-transaction and the remote snapshot is unchanged, so this is
- *		exactly repeatable.
+ * repfdwReScanForeignScan (v2 -- M0b)
+ *		Cancel/drain any in-flight stream and resend this child's slice query
+ *		(the remote snapshot is unchanged, so this is exactly repeatable).
  */
 static void
 repfdwReScanForeignScan(ForeignScanState *node)
@@ -641,20 +711,17 @@ repfdwReScanForeignScan(ForeignScanState *node)
 	if (fsstate == NULL)
 		return;
 
-	if (fsstate->my_res != NULL)
-	{
-		PQclear(fsstate->my_res);
-		fsstate->my_res = NULL;
-	}
+	if (fsstate->my_started)
+		RepFdwCancelDrainOne(&fsstate->rset->conns[fsstate->my_index]);
 
 	repfdw_run_slice_query(fsstate);
 }
 
 /*
- * repfdwEndForeignScan (v2 -- M0)
- *		Free this node's buffered result.  The shared connections and remote
- *		transaction are left for the xact callback to close at local
- *		commit/abort; the blocking exec already left the connection idle.
+ * repfdwEndForeignScan (v2 -- M0b)
+ *		Cancel/drain this child's in-flight stream so its connection returns to
+ *		idle-in-transaction.  The connection and remote transaction are left for
+ *		the xact callback to close at local commit/abort.
  */
 static void
 repfdwEndForeignScan(ForeignScanState *node)
@@ -664,13 +731,134 @@ repfdwEndForeignScan(ForeignScanState *node)
 	if (fsstate == NULL)
 		return;
 
-	if (fsstate->my_res != NULL)
-	{
-		PQclear(fsstate->my_res);
-		fsstate->my_res = NULL;
-	}
+	if (fsstate->my_started)
+		RepFdwCancelDrainOne(&fsstate->rset->conns[fsstate->my_index]);
+
+	if (fsstate->batch_cxt)
+		MemoryContextDelete(fsstate->batch_cxt);
 	if (fsstate->row_cxt)
 		MemoryContextDelete(fsstate->row_cxt);
+}
+
+/*
+ * repfdwIsForeignPathAsyncCapable
+ *		Every per-replica child is async-capable: that is the whole point of the
+ *		v2 Append (all replicas stream at once).
+ */
+static bool
+repfdwIsForeignPathAsyncCapable(ForeignPath *path)
+{
+	return true;
+}
+
+/*
+ * repfdw_async_produce
+ *		Core of the async callbacks.  If a row is buffered for this child, run
+ *		the node's own ExecProcNode so ExecScan applies the ForeignScan's quals
+ *		and projection (returning a properly formed result slot) -- exactly as
+ *		postgres_fdw does; handing back a raw scan slot skips projection and
+ *		corrupts the tuple the parent reads.  Otherwise signal EOF if the
+ *		stream is finished, or mark the request pending so the Append waits on
+ *		our socket.  Unlike postgres_fdw we never multiplex a connection across
+ *		requests -- each child owns conns[my_index] -- so there is no
+ *		pending-request juggling.
+ */
+static void
+repfdw_async_produce(AsyncRequest *areq)
+{
+	ForeignScanState *node = (ForeignScanState *) areq->requestee;
+	RepFdwScanState *fsstate = (RepFdwScanState *) node->fdw_state;
+	ReplicaConn *rconn;
+
+	if (!fsstate->my_active)
+	{
+		ExecAsyncRequestDone(areq, NULL);
+		return;
+	}
+
+	rconn = &fsstate->rset->conns[fsstate->my_index];
+
+	/*
+	 * A row is buffered: let the node's normal ExecProcNode path pull it
+	 * (IterateForeignScan returns it without blocking, since it is already
+	 * queued) and project it.
+	 */
+	if (rconn->rowqueue != NIL)
+	{
+		TupleTableSlot *result = node->ss.ps.ExecProcNodeReal((PlanState *) node);
+
+		if (!TupIsNull(result))
+		{
+			ExecAsyncRequestDone(areq, result);
+			return;
+		}
+	}
+
+	if (rconn->state != REP_STREAMING)
+	{
+		/* stream finished, nothing buffered: EOF */
+		ExecAsyncRequestDone(areq, NULL);
+		return;
+	}
+
+	/* No row yet; ask the Append to wait for our socket. */
+	ExecAsyncRequestPending(areq);
+}
+
+/*
+ * repfdwForeignAsyncRequest
+ *		The Append wants a tuple from this child.
+ */
+static void
+repfdwForeignAsyncRequest(AsyncRequest *areq)
+{
+	repfdw_async_produce(areq);
+}
+
+/*
+ * repfdwForeignAsyncConfigureWait
+ *		Register this child's socket in the Append's WaitEventSet so it is woken
+ *		when data arrives.
+ */
+static void
+repfdwForeignAsyncConfigureWait(AsyncRequest *areq)
+{
+	ForeignScanState *node = (ForeignScanState *) areq->requestee;
+	RepFdwScanState *fsstate = (RepFdwScanState *) node->fdw_state;
+	AppendState *requestor = (AppendState *) areq->requestor;
+	WaitEventSet *set = requestor->as_eventset;
+	ReplicaConn *rconn = &fsstate->rset->conns[fsstate->my_index];
+
+	Assert(areq->callback_pending);
+
+	AddWaitEventToSet(set, WL_SOCKET_READABLE, PQsocket(rconn->conn),
+					  NULL, areq);
+}
+
+/*
+ * repfdwForeignAsyncNotify
+ *		Our socket signalled readable: drain available input and try to produce
+ *		a tuple (or conclude EOF, or go pending again).
+ */
+static void
+repfdwForeignAsyncNotify(AsyncRequest *areq)
+{
+	ForeignScanState *node = (ForeignScanState *) areq->requestee;
+	RepFdwScanState *fsstate = (RepFdwScanState *) node->fdw_state;
+	ReplicaConn *rconn = &fsstate->rset->conns[fsstate->my_index];
+
+	Assert(!areq->callback_pending);
+
+	if (fsstate->my_active && rconn->state == REP_STREAMING)
+	{
+		/* Queue chunks in batch_cxt (see IterateForeignScan). */
+		MemoryContext oldcxt = MemoryContextSwitchTo(fsstate->batch_cxt);
+
+		RepFdwDrainConn(rconn, fsstate->fetch_size);
+		MemoryContextSwitchTo(oldcxt);
+	}
+
+	repfdw_async_produce(areq);
 }
 
 /*
