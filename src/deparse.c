@@ -139,7 +139,7 @@ RepFdwDeparseCountTemplate(const char *schema, const char *table)
  *		deparsed template, using $1/$2 bind-parameter placeholders for
  *		whichever bound(s) are present (NULL/NULL means the whole
  *		relation, i.e. no WHERE clause at all).  The parameter order here
- *		must match the values RepFdwStartQueries binds.
+ *		must match the values RepFdwStartOneQuery binds.
  */
 char *
 RepFdwBuildBoundedSql(const char *base_sql, const char *remote_pred,

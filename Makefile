@@ -2,7 +2,7 @@
 
 MODULE_big = pg_replica_fanout_fdw
 OBJS = src/pg_replica_fanout_fdw.o src/option.o src/connection.o src/deparse.o \
-       src/slice.o src/merge.o
+       src/slice.o
 
 EXTENSION = pg_replica_fanout_fdw
 DATA = sql/pg_replica_fanout_fdw--0.1.0.sql

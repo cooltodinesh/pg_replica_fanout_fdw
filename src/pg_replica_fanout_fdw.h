@@ -106,11 +106,18 @@ typedef struct ReplicaSet
 } ReplicaSet;
 
 /*
- * fdw_private (plan -> exec), one positional layout for both the plain-scan
- * and count(*) pushdown plan shapes:
- *   {sql_template, retrieved_attrs, remote_pred, is_count_agg, foreigntableid}
- * remote_pred is an empty string, not NIL, when there is no pushed predicate
- * (a plain string node keeps the list a fixed-arity 5-tuple).
+ * Per-scan-node execution state.  In the v2 Append-of-per-replica-scans model
+ * (notes/v2-append-architecture.md) each ForeignScan node owns exactly one
+ * replica's connection (rconn) and streams its ctid slice in chunked-rows mode;
+ * an async-capable Append drives all N children's sockets concurrently via the
+ * ForeignAsync* callbacks, and the same streaming state feeds the synchronous
+ * IterateForeignScan fallback.
+ *
+ * fdw_private (plan -> exec) is the 7-tuple
+ *   {sql_template, retrieved_attrs, remote_pred, is_count_agg, foreigntableid,
+ *    my_index, nreplicas}
+ * (remote_pred is "" not NIL when there is no pushed predicate; is_count_agg is
+ * currently always false -- the v1 count combine is disabled in v2).
  */
 typedef struct RepFdwScanState
 {
@@ -123,46 +130,11 @@ typedef struct RepFdwScanState
 								 * "WHERE" and no ctid bound; NULL if none */
 	int			fetch_size;
 
-	/* slicing, computed once in BeginForeignScan */
-	BlockNumber nblocks;
-	int			nslices;		/* P: number of replicas actually queried */
-	char	  **replica_sqls;	/* array[nslices], final per-replica SQL
-								 * (with $1/$2 ctid placeholders), kept
-								 * around so ReScan can resend it unchanged */
-	RepFdwCtidBound *replica_bounds;	/* array[nslices], bind values to go
-										 * with replica_sqls */
-
-	/* round-robin merge state */
-	int			rr_cursor;
-
 	AttInMetadata *attinmeta;
-	MemoryContext batch_cxt;	/* holds queued PGresults */
+	MemoryContext batch_cxt;	/* holds queued PGresult chunks */
 	MemoryContext row_cxt;		/* reset per output row */
 
-	bool		eof;
-
-	/* persistent streaming WaitEventSet -- see RepStreamPump */
-	WaitEventSet *stream_wes;
-	bool		wes_dirty;		/* active-socket membership changed since
-								 * stream_wes was last built */
-
-	/*
-	 * true for the pushed-down "SELECT count(*)" plan shape (scanrelid==0,
-	 * no fan-out Agg node above this scan): each replica returns one
-	 * partial int8 count and RepFdwNextCountTuple sums them into a single
-	 * emitted row instead of merging raw rows.
-	 */
-	bool		is_count_agg;
-
-	/*
-	 * v2 (M0) per-replica scan state.  In the v2 architecture each replica's
-	 * slice is a separate ForeignScan node under an Append (see
-	 * notes/v2-append-architecture.md); this node owns exactly one replica's
-	 * connection (rset->conns[my_index]) and streams it in chunked-rows mode.
-	 * An async-capable Append (M0b) drives all N children's sockets
-	 * concurrently via the ForeignAsync* callbacks; the same streaming state
-	 * feeds the synchronous IterateForeignScan fallback.
-	 */
+	/* per-replica scan state: this node owns one replica's slice */
 	int			my_index;		/* this node's replica/slice index */
 	int			nreplicas;		/* total replicas = Append child count */
 	ReplicaConn *rconn;			/* this node's checked-out connection */
@@ -180,19 +152,13 @@ extern void RepFdwBeginRemoteXact(ReplicaSet *rset);
 extern ReplicaConn *RepFdwCheckoutConn(ReplicaSet *rset, RepFdwOptions *opts,
 									   UserMapping *user, int index);
 extern void RepFdwReturnConn(ReplicaConn *rconn);
-extern void RepFdwStartQueries(ReplicaSet *rset, int nactive, char **sqls,
-								RepFdwCtidBound *bounds, int fetch_size);
-extern void RepStreamPump(struct RepFdwScanState *fsstate);
 extern int	RepFdwQueuedRowCount(ReplicaConn *rconn);
-extern void RepFdwCancelAndDrain(ReplicaSet *rset, int nactive);
 extern void RepFdwStartOneQuery(ReplicaConn *rconn, const char *sql,
 								const RepFdwCtidBound *bound, int fetch_size);
 extern void RepFdwDrainConn(ReplicaConn *rconn, int fetch_size);
 extern void RepFdwPumpOne(ReplicaConn *rconn, int fetch_size);
 extern void RepFdwCancelDrainOne(ReplicaConn *rconn);
 extern PGresult *RepFdwExecSync(ReplicaConn *rconn, const char *sql);
-extern PGresult *RepFdwExecBounded(ReplicaConn *rconn, const char *sql,
-								   const RepFdwCtidBound *bound);
 pg_noreturn extern void RepFdwReportError(PGresult *res, ReplicaConn *rconn,
 										   const char *sql);
 
@@ -213,11 +179,5 @@ extern char *RepFdwBuildBoundedSql(const char *base_sql,
 extern bool RepFdwIsForeignQual(PlannerInfo *root, RelOptInfo *baserel,
 								 Expr *expr);
 extern char *RepFdwDeparseQuals(Oid foreigntableid, List *remote_exprs);
-
-/* in merge.c */
-extern TupleTableSlot *RepFdwNextTuple(RepFdwScanState *fsstate,
-										ForeignScanState *node);
-extern TupleTableSlot *RepFdwNextCountTuple(RepFdwScanState *fsstate,
-											 ForeignScanState *node);
 
 #endif							/* PG_REPLICA_FANOUT_FDW_H */

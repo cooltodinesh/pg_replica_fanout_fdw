@@ -200,17 +200,12 @@ repfdwGetForeignPaths(PlannerInfo *root, RelOptInfo *baserel,
 
 /*
  * repfdwGetForeignUpperPaths
- *		Claim UPPERREL_GROUP_AGG for a single, narrow shape: count(*) over
- *		one of our foreign baserels, with an entirely shippable WHERE (or
- *		none) and no GROUP BY/HAVING/DISTINCT.  Each replica will compute
- *		its own partial count over its ctid slice (and the shippable
- *		predicate, if any) and the coordinator sums them -- see
- *		RepFdwNextCountTuple in merge.c -- so there is no Agg node above the
- *		Foreign Scan in the finished plan.
- *
- *		Anything not recognized here must fall back to a normal scan plus a
- *		local Agg: we bail out (add no path) rather than risk a wrong
- *		answer.
+ *		Disabled in v2 (returns immediately): aggregation is handled by native
+ *		Agg nodes over the Append of per-replica scans, not by an internal
+ *		combine (see repfdwGetForeignPaths and notes/v2-append-architecture.md).
+ *		The v1 count(*) upper-path pushdown below is retained, unreached, as the
+ *		starting point for M3 remote partial-aggregate pushdown (a per-child
+ *		Partial Aggregate + a local Finalize Aggregate).
  */
 static void
 repfdwGetForeignUpperPaths(PlannerInfo *root, UpperRelationKind stage,

@@ -665,113 +665,6 @@ RepFdwExecSync(ReplicaConn *rconn, const char *sql)
 }
 
 /*
- * RepFdwExecBounded
- *		Run one ctid-bounded slice query on a single replica connection,
- *		blocking (but interruptibly) until the whole result is in, and return
- *		the PGRES_TUPLES_OK result.  Binds the $1/$2 ctid bounds the same way
- *		RepFdwStartQueries does.  Drains to the terminating NULL result so
- *		libpq's asyncStatus returns to IDLE and the connection is immediately
- *		reusable (e.g. by ReScan).  This is the v2 M0 synchronous per-node
- *		path; async streaming is M0b.
- */
-PGresult *
-RepFdwExecBounded(ReplicaConn *rconn, const char *sql,
-				  const RepFdwCtidBound *bound)
-{
-	Oid			paramTypes[2];
-	const char *paramValues[2];
-	int			nparams = 0;
-	PGresult   *res = NULL;
-
-	if (bound->lo != NULL)
-	{
-		paramTypes[nparams] = TIDOID;
-		paramValues[nparams] = bound->lo;
-		nparams++;
-	}
-	if (bound->hi != NULL)
-	{
-		paramTypes[nparams] = TIDOID;
-		paramValues[nparams] = bound->hi;
-		nparams++;
-	}
-
-	if (!PQsendQueryParams(rconn->conn, sql, nparams, paramTypes,
-						   paramValues, NULL, NULL, 0))
-		RepFdwReportError(NULL, rconn, sql);
-
-	for (;;)
-	{
-		PGresult   *r = libpqsrv_get_result(rconn->conn, we_stream);
-
-		if (r == NULL)
-			break;
-		if (PQresultStatus(r) == PGRES_TUPLES_OK)
-		{
-			if (res != NULL)
-				PQclear(res);
-			res = r;
-		}
-		else if (PQresultStatus(r) == PGRES_FATAL_ERROR)
-			RepFdwReportError(r, rconn, sql);	/* does not return */
-		else
-			PQclear(r);
-	}
-
-	rconn->state = REP_IN_TXN;
-	return res;
-}
-
-/*
- * RepFdwStartQueries
- *		Send the per-replica SELECT (ctid range bound via $1/$2) to the
- *		first nactive connections, in chunked-rows streaming mode.
- */
-void
-RepFdwStartQueries(ReplicaSet *rset, int nactive, char **sqls,
-				   RepFdwCtidBound *bounds, int fetch_size)
-{
-	int			i;
-
-	for (i = 0; i < nactive; i++)
-	{
-		ReplicaConn *rconn = &rset->conns[i];
-		Oid			paramTypes[2];
-		const char *paramValues[2];
-		int			nparams = 0;
-
-		if (bounds[i].lo != NULL)
-		{
-			paramTypes[nparams] = TIDOID;
-			paramValues[nparams] = bounds[i].lo;
-			nparams++;
-		}
-		if (bounds[i].hi != NULL)
-		{
-			paramTypes[nparams] = TIDOID;
-			paramValues[nparams] = bounds[i].hi;
-			nparams++;
-		}
-
-		if (!PQsendQueryParams(rconn->conn, sqls[i], nparams, paramTypes,
-							   paramValues, NULL, NULL, 0))
-			RepFdwReportError(NULL, rconn, sqls[i]);
-
-		/* Must be called after PQsendQueryParams, before consuming any results. */
-		if (PQsetChunkedRowsMode(rconn->conn, fetch_size) != 1)
-			ereport(ERROR,
-					(errcode(ERRCODE_CONNECTION_EXCEPTION),
-					 errmsg("could not enable chunked rows mode for replica \"%s:%d\"",
-							rconn->host, rconn->port)));
-
-		rconn->state = REP_STREAMING;
-		rconn->rowqueue = NIL;
-		rconn->cur_row = 0;
-		rconn->paused = false;
-	}
-}
-
-/*
  * RepFdwQueuedRowCount
  *		Number of not-yet-consumed rows currently buffered for a replica.
  */
@@ -842,108 +735,6 @@ drain_conn(ReplicaConn *rconn, int fetch_size)
 				PQclear(res);
 				continue;
 		}
-	}
-}
-
-/*
- * RepStreamPump
- *		Advance the streaming loop until at least one replica makes
- *		progress (gains a queued chunk or finishes) or there is nothing
- *		left to wait for.
- *
- *		The WaitEventSet is cached on fsstate and reused across calls,
- *		rebuilt only when active-socket membership has changed (a conn
- *		finished, or its pause state flipped -- see wes_dirty) rather than
- *		on every call, which is what made this the hot path's main source
- *		of epoll_create/close churn on a large scan.
- */
-void
-RepStreamPump(RepFdwScanState *fsstate)
-{
-	ReplicaSet *rset = fsstate->rset;
-	int			nactive = fsstate->nslices;
-	int			fetch_size = fsstate->fetch_size;
-	int			i;
-	int			nevents;
-
-	nevents = 0;
-	for (i = 0; i < nactive; i++)
-		if (rset->conns[i].state == REP_STREAMING && !rset->conns[i].paused)
-			nevents++;
-
-	if (nevents == 0)
-		return;
-
-	if (fsstate->stream_wes == NULL || fsstate->wes_dirty)
-	{
-		if (fsstate->stream_wes != NULL)
-		{
-			FreeWaitEventSet(fsstate->stream_wes);
-			fsstate->stream_wes = NULL;
-		}
-
-		fsstate->stream_wes = CreateWaitEventSet(CurrentResourceOwner,
-												 nactive + 2);
-		AddWaitEventToSet(fsstate->stream_wes, WL_EXIT_ON_PM_DEATH,
-						  PGINVALID_SOCKET, NULL, NULL);
-		AddWaitEventToSet(fsstate->stream_wes, WL_LATCH_SET, PGINVALID_SOCKET,
-						  MyLatch, NULL);
-
-		for (i = 0; i < nactive; i++)
-		{
-			ReplicaConn *rconn = &rset->conns[i];
-
-			if (rconn->state != REP_STREAMING || rconn->paused)
-				continue;
-
-			AddWaitEventToSet(fsstate->stream_wes, WL_SOCKET_READABLE,
-							  PQsocket(rconn->conn), NULL, rconn);
-		}
-
-		fsstate->wes_dirty = false;
-	}
-
-	for (;;)
-	{
-		WaitEvent	occurred[REP_MAX_WAIT_EVENTS];
-		int			noccurred;
-		bool		made_progress = false;
-
-		noccurred = WaitEventSetWait(fsstate->stream_wes, -1, occurred,
-									 Min(nactive + 2, REP_MAX_WAIT_EVENTS),
-									 we_stream);
-
-		for (i = 0; i < noccurred; i++)
-		{
-			WaitEvent  *w = &occurred[i];
-
-			if (w->events & WL_LATCH_SET)
-			{
-				ResetLatch(MyLatch);
-				CHECK_FOR_INTERRUPTS();
-			}
-
-			if (w->events & WL_SOCKET_READABLE)
-			{
-				ReplicaConn *rconn = (ReplicaConn *) w->user_data;
-				int			before_rows = RepFdwQueuedRowCount(rconn);
-				RepConnState before_state = rconn->state;
-				bool		paused_before = rconn->paused;
-
-				drain_conn(rconn, fetch_size);
-
-				if (rconn->state != before_state ||
-					rconn->paused != paused_before)
-					fsstate->wes_dirty = true;
-
-				if (rconn->state != before_state ||
-					RepFdwQueuedRowCount(rconn) != before_rows)
-					made_progress = true;
-			}
-		}
-
-		if (made_progress)
-			break;
 	}
 }
 
@@ -1052,8 +843,8 @@ RepFdwPumpOne(ReplicaConn *rconn, int fetch_size)
 /*
  * RepFdwCancelDrainOne
  *		Cancel any in-flight query on one connection and drain it back to
- *		idle-in-transaction.  Single-connection form of RepFdwCancelAndDrain,
- *		used by the v2 per-child ReScan/End.
+ *		idle-in-transaction; used by the per-child ReScan/End and by
+ *		RepFdwReturnConn.
  */
 void
 RepFdwCancelDrainOne(ReplicaConn *rconn)
@@ -1094,65 +885,6 @@ RepFdwCancelDrainOne(ReplicaConn *rconn)
 	rconn->paused = false;
 	if (rconn->state != REP_DEAD)
 		rconn->state = REP_IN_TXN;
-}
-
-/*
- * RepFdwCancelAndDrain
- *		Cancel any in-flight query on the first nactive replicas and drain
- *		results so the connections go back to idle-in-transaction.  Used by
- *		both ReScan (before resending) and EndForeignScan (before caching
- *		the connection for the next query).
- */
-void
-RepFdwCancelAndDrain(ReplicaSet *rset, int nactive)
-{
-	int			i;
-	TimestampTz endtime = TimestampTzPlusMilliseconds(GetCurrentTimestamp(), 5000);
-
-	for (i = 0; i < nactive; i++)
-	{
-		ReplicaConn *rconn = &rset->conns[i];
-		ListCell   *lc;
-
-		if (rconn->conn == NULL)
-			continue;
-
-		if (rconn->state == REP_STREAMING)
-		{
-			const char *err = libpqsrv_cancel(rconn->conn, endtime);
-
-			if (err != NULL)
-				ereport(WARNING,
-						(errmsg("could not cancel query on replica \"%s:%d\": %s",
-								rconn->host, rconn->port, err)));
-
-			/*
-			 * Keep fetching until PQgetResult truly returns NULL -- that is
-			 * the only thing that resets libpq's asyncStatus to IDLE, so we
-			 * must not stop merely because we've seen PGRES_TUPLES_OK.
-			 */
-			for (;;)
-			{
-				PGresult   *res = libpqsrv_get_result(rconn->conn, we_stream);
-
-				if (res == NULL)
-					break;
-				if (PQresultStatus(res) == PGRES_TUPLES_OK)
-					rconn->state = REP_DONE;
-				PQclear(res);
-			}
-			rconn->state = REP_DONE;
-		}
-
-		foreach(lc, rconn->rowqueue)
-			PQclear((PGresult *) lfirst(lc));
-		list_free(rconn->rowqueue);
-		rconn->rowqueue = NIL;
-		rconn->cur_row = 0;
-		rconn->paused = false;
-		if (rconn->state != REP_DEAD)
-			rconn->state = REP_IN_TXN;
-	}
 }
 
 /*
