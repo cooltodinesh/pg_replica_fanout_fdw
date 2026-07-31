@@ -30,6 +30,7 @@
 #include "optimizer/planmain.h"
 #include "optimizer/restrictinfo.h"
 #include "optimizer/tlist.h"
+#include "utils/builtins.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "utils/rel.h"
@@ -221,14 +222,15 @@ repfdwGetForeignUpperPaths(PlannerInfo *root, UpperRelationKind stage,
 	ForeignPath *path;
 
 	/*
-	 * v2 (M0): aggregation is handled by native Agg nodes stacked on the
-	 * Append of per-replica scans (see repfdwGetForeignPaths and
-	 * notes/v2-append-architecture.md), not by an internal combine.  The v1
-	 * count(*) upper-path pushdown below is disabled for now; remote
-	 * partial-aggregate pushdown is a later milestone (M3), at which point
-	 * this becomes a per-child Partial Aggregate + local Finalize.
+	 * M3: remote aggregate pushdown for the decomposable class.  Because the
+	 * FDW upper-path API yields a single ForeignPath for the *final* grouped
+	 * result (and our FDW-built Append over one baserel never triggers core's
+	 * partitionwise/AGGSPLIT Finalize machinery), a pushed aggregate is a
+	 * scanrelid==0 foreign node that fans a partial-aggregate query to every
+	 * replica and combines the partials itself -- see repfdwBeginForeignScan's
+	 * agg branch and notes/v2-append-architecture.md.  Currently only a bare
+	 * count(*) is recognized; sum/min/max/avg and GROUP BY are follow-ons.
 	 */
-	return;
 
 	/* 1. Only the plain full-aggregation upper stage; ignore the rest. */
 	if (stage != UPPERREL_GROUP_AGG)
@@ -387,11 +389,19 @@ repfdwGetForeignPlan(PlannerInfo *root, RelOptInfo *baserel,
 		}
 		remote_pred = RepFdwDeparseQuals(fpinfo->foreigntableid, remote_exprs);
 
+		/*
+		 * Same 7-tuple layout as a plain scan child, with is_count_agg=true
+		 * marking the aggregate combine node.  my_index is -1 (the agg node
+		 * fans to all replicas, not one), nreplicas drives the fan-out.
+		 */
 		fdw_private = list_make5(makeString(count_sql),
 								 NIL,
 								 makeString(remote_pred ? remote_pred : ""),
 								 makeBoolean(true),
 								 makeInteger(fpinfo->foreigntableid));
+		fdw_private = lappend(fdw_private, makeInteger(-1));
+		fdw_private = lappend(fdw_private,
+							  makeInteger(list_length(fpinfo->opts->replicas)));
 
 		return make_foreignscan(tlist,
 								NIL,	/* no local exprs */
@@ -525,6 +535,111 @@ repfdw_run_slice_query(RepFdwScanState *fsstate)
 }
 
 /*
+ * repfdw_agg_start
+ *		Set up the aggregate combine node (scanrelid==0): discover nblocks,
+ *		compute the P slices, check out one connection per participating
+ *		replica, and *send* each replica's partial-aggregate query now.  Sending
+ *		all P up front makes the replicas run concurrently; the partials are
+ *		gathered later in repfdw_agg_combine (so total time ~= the slowest
+ *		replica, not the sum).
+ */
+static void
+repfdw_agg_send(RepFdwScanState *fsstate)
+{
+	int			i;
+
+	for (i = 0; i < fsstate->agg_nconns; i++)
+	{
+		/* Idempotent for a fresh conn; drains a prior run on ReScan. */
+		RepFdwCancelDrainOne(fsstate->agg_conns[i]);
+		RepFdwStartOneQuery(fsstate->agg_conns[i], fsstate->agg_sqls[i],
+							&fsstate->agg_bounds[i], fsstate->fetch_size);
+	}
+	fsstate->agg_done = false;
+}
+
+static void
+repfdw_agg_start(RepFdwScanState *fsstate, RepFdwOptions *opts, UserMapping *user)
+{
+	ReplicaConn *c0;
+	BlockNumber nblocks;
+	int			P;
+	int			i;
+
+	/* Replica 0's connection tells us nblocks; it is also slice 0. */
+	c0 = RepFdwCheckoutConn(fsstate->rset, opts, user, 0);
+	nblocks = RepFdwGetNBlocks(c0, opts->schema_name, opts->table_name);
+	P = RepFdwComputeSlices(nblocks, fsstate->nreplicas,
+							opts->min_blocks_per_slice, &fsstate->agg_bounds);
+
+	fsstate->agg_nconns = P;
+	fsstate->agg_conns = (ReplicaConn **) palloc(sizeof(ReplicaConn *) * P);
+	fsstate->agg_sqls = (char **) palloc(sizeof(char *) * P);
+
+	for (i = 0; i < P; i++)
+	{
+		fsstate->agg_conns[i] = (i == 0) ? c0 :
+			RepFdwCheckoutConn(fsstate->rset, opts, user, i);
+		fsstate->agg_sqls[i] = RepFdwBuildBoundedSql(fsstate->sql_template,
+													 fsstate->remote_pred,
+													 &fsstate->agg_bounds[i]);
+	}
+
+	repfdw_agg_send(fsstate);
+}
+
+/*
+ * repfdw_agg_combine
+ *		Gather the one partial row from each replica and combine into the single
+ *		output row.  For count(*) the partial is an int8 per slice and the
+ *		combine is a sum.  (The decomposable class -- sum/min/max/avg -- will
+ *		generalize this with a per-column combine spec.)
+ */
+static void
+repfdw_agg_combine(RepFdwScanState *fsstate, TupleTableSlot *slot)
+{
+	int64		total = 0;
+	int			i;
+
+	for (i = 0; i < fsstate->agg_nconns; i++)
+	{
+		ReplicaConn *ci = fsstate->agg_conns[i];
+		PGresult   *res;
+
+		/* Finish draining this replica's partial (it has been running since Begin). */
+		while (ci->state == REP_STREAMING)
+		{
+			MemoryContext oldcxt = MemoryContextSwitchTo(fsstate->batch_cxt);
+
+			RepFdwPumpOne(ci, fsstate->fetch_size);
+			MemoryContextSwitchTo(oldcxt);
+		}
+
+		if (ci->rowqueue == NIL)
+			elog(ERROR,
+				 "pg_replica_fanout_fdw: replica \"%s:%d\" returned no partial aggregate",
+				 ci->host, ci->port);
+
+		res = (PGresult *) linitial(ci->rowqueue);
+		if (PQntuples(res) != 1 || PQgetisnull(res, 0, 0))
+			elog(ERROR,
+				 "pg_replica_fanout_fdw: unexpected partial aggregate from replica \"%s:%d\"",
+				 ci->host, ci->port);
+
+		total += pg_strtoint64(PQgetvalue(res, 0, 0));
+
+		PQclear(res);
+		ci->rowqueue = list_delete_first(ci->rowqueue);
+		ci->cur_row = 0;
+	}
+
+	ExecClearTuple(slot);
+	slot->tts_values[0] = Int64GetDatum(total);
+	slot->tts_isnull[0] = false;
+	ExecStoreVirtualTuple(slot);
+}
+
+/*
  * repfdw_store_next_row
  *		If a row is buffered for this child, materialize it into slot and
  *		return true; otherwise return false (caller must drain more input or
@@ -597,6 +712,7 @@ repfdwBeginForeignScan(ForeignScanState *node, int eflags)
 	List	   *fdw_private = fsplan->fdw_private;
 	Oid			foreigntableid;
 	char	   *remote_pred;
+	bool		is_count_agg;
 	RepFdwScanState *fsstate;
 	RepFdwOptions *opts;
 	ForeignServer *server;
@@ -606,13 +722,16 @@ repfdwBeginForeignScan(ForeignScanState *node, int eflags)
 		return;
 
 	/*
-	 * Plan-time fdw_private for a v2 Append child:
-	 *   {sql_template, retrieved_attrs, remote_pred, is_count_agg(false),
+	 * fdw_private 7-tuple:
+	 *   {sql_template, retrieved_attrs, remote_pred, is_count_agg,
 	 *    foreigntableid, my_index, nreplicas}
+	 * is_count_agg=true is the aggregate combine node (scanrelid==0, fans to
+	 * all replicas); false is a per-replica Append child (owns my_index).
 	 */
 	remote_pred = strVal(lthird(fdw_private));
 	if (remote_pred[0] == '\0')
 		remote_pred = NULL;
+	is_count_agg = boolVal(lfourth(fdw_private));
 	foreigntableid = (Oid) intVal(list_nth(fdw_private, 4));
 
 	RepFdwGetOptions(foreigntableid, &opts);
@@ -626,25 +745,38 @@ repfdwBeginForeignScan(ForeignScanState *node, int eflags)
 	fsstate->retrieved_attrs = (List *) lsecond(fdw_private);
 	fsstate->remote_pred = remote_pred;
 	fsstate->fetch_size = opts->fetch_size;
+	fsstate->is_agg = is_count_agg;
 	fsstate->my_index = intVal(list_nth(fdw_private, 5));
 	fsstate->nreplicas = intVal(list_nth(fdw_private, 6));
 
 	fsstate->rset = RepFdwGetConnections(user, opts);
 	RepFdwBeginRemoteXact(fsstate->rset);
 
-	/*
-	 * Claim this child's own connection to its replica.  Two concurrently live
-	 * scans of the same server (e.g. a self-join) get distinct connections
-	 * (cached primary + overflow), so they no longer collide on one socket.
-	 */
-	fsstate->rconn = RepFdwCheckoutConn(fsstate->rset, opts, user,
-										fsstate->my_index);
-
-	fsstate->attinmeta =
-		TupleDescGetAttInMetadata(RelationGetDescr(node->ss.ss_currentRelation));
 	fsstate->batch_cxt = AllocSetContextCreate(CurrentMemoryContext,
 											   "pg_replica_fanout_fdw batch",
 											   ALLOCSET_DEFAULT_SIZES);
+
+	if (fsstate->is_agg)
+	{
+		/*
+		 * Aggregate combine node: no scan relation (scanrelid==0, so
+		 * ss_currentRelation is NULL and there is no attinmeta), fan the
+		 * partial query to every replica now.
+		 */
+		node->fdw_state = fsstate;
+		repfdw_agg_start(fsstate, opts, user);
+		return;
+	}
+
+	/*
+	 * Per-replica Append child.  Claim its own connection to its replica; two
+	 * concurrently live scans of the same server (e.g. a self-join) get
+	 * distinct connections (cached primary + overflow) instead of colliding.
+	 */
+	fsstate->rconn = RepFdwCheckoutConn(fsstate->rset, opts, user,
+										fsstate->my_index);
+	fsstate->attinmeta =
+		TupleDescGetAttInMetadata(RelationGetDescr(node->ss.ss_currentRelation));
 	fsstate->row_cxt = AllocSetContextCreate(CurrentMemoryContext,
 											 "pg_replica_fanout_fdw row",
 											 ALLOCSET_SMALL_SIZES);
@@ -667,6 +799,19 @@ repfdwIterateForeignScan(ForeignScanState *node)
 	RepFdwScanState *fsstate = (RepFdwScanState *) node->fdw_state;
 	TupleTableSlot *slot = node->ss.ss_ScanTupleSlot;
 	ReplicaConn *rconn;
+
+	/* Aggregate combine node: gather all replicas' partials, emit one row. */
+	if (fsstate->is_agg)
+	{
+		if (fsstate->agg_done)
+		{
+			ExecClearTuple(slot);
+			return slot;
+		}
+		repfdw_agg_combine(fsstate, slot);
+		fsstate->agg_done = true;
+		return slot;
+	}
 
 	if (!fsstate->my_active)
 	{
@@ -714,6 +859,13 @@ repfdwReScanForeignScan(ForeignScanState *node)
 	if (fsstate == NULL)
 		return;
 
+	if (fsstate->is_agg)
+	{
+		/* Resend the partials on the already-checked-out connections. */
+		repfdw_agg_send(fsstate);
+		return;
+	}
+
 	if (fsstate->my_started)
 		RepFdwCancelDrainOne(fsstate->rconn);
 
@@ -734,8 +886,15 @@ repfdwEndForeignScan(ForeignScanState *node)
 	if (fsstate == NULL)
 		return;
 
-	/* Release our checked-out connection (drains any in-flight query). */
-	if (fsstate->rconn != NULL)
+	/* Release checked-out connection(s), draining any in-flight query. */
+	if (fsstate->is_agg)
+	{
+		int			i;
+
+		for (i = 0; i < fsstate->agg_nconns; i++)
+			RepFdwReturnConn(fsstate->agg_conns[i]);
+	}
+	else if (fsstate->rconn != NULL)
 		RepFdwReturnConn(fsstate->rconn);
 
 	if (fsstate->batch_cxt)
@@ -746,13 +905,15 @@ repfdwEndForeignScan(ForeignScanState *node)
 
 /*
  * repfdwIsForeignPathAsyncCapable
- *		Every per-replica child is async-capable: that is the whole point of the
- *		v2 Append (all replicas stream at once).
+ *		Every per-replica child (a baserel scan) is async-capable: that is the
+ *		whole point of the v2 Append (all replicas stream at once).  The
+ *		aggregate upper path (scanrelid==0, RELOPT_UPPER_REL) fans out and
+ *		combines synchronously, so it is not async.
  */
 static bool
 repfdwIsForeignPathAsyncCapable(ForeignPath *path)
 {
-	return true;
+	return ((Path *) path)->parent->reloptkind == RELOPT_BASEREL;
 }
 
 /*
@@ -877,10 +1038,13 @@ repfdwExplainForeignScan(ForeignScanState *node, ExplainState *es)
 	List	   *fdw_private = fsplan->fdw_private;
 	char	   *sql_template = strVal(linitial(fdw_private));
 	char	   *remote_pred = strVal(lthird(fdw_private));
+	bool		is_count_agg = boolVal(lfourth(fdw_private));
 	int			my_index = intVal(list_nth(fdw_private, 5));
 	int			nreplicas = intVal(list_nth(fdw_private, 6));
 
-	ExplainPropertyInteger("Replica", NULL, my_index, es);
+	/* Per-child scan shows its replica index; the agg node fans to all. */
+	if (!is_count_agg)
+		ExplainPropertyInteger("Replica", NULL, my_index, es);
 	ExplainPropertyInteger("Replicas", NULL, nreplicas, es);
 
 	/*

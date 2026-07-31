@@ -1,11 +1,17 @@
--- aggregation.sql (v2): aggregation is handled by native PostgreSQL Agg nodes
--- stacked on the Append of per-replica Async Foreign Scans -- not by any
--- internal combine.  This is the v2 architecture (notes/v2-append-architecture.md):
--- each replica streams its own ctid slice concurrently, and core aggregates the
--- union.  GROUP BY / avg / etc. therefore work for free, unlike v1.
+-- aggregation.sql (v2 + M3): two aggregation paths coexist.
 --
--- Checks are discriminating: a broken slice map would make the counts wrong, and
--- a stale/1-slice plan would show fewer than 3 Async Foreign Scan children.
+--  * A bare count(*) (optionally with a shippable WHERE) is PUSHED DOWN: a
+--    scanrelid==0 Foreign Scan fans "SELECT count(*)" to every replica and
+--    combines the partials -- one row per replica on the wire, no coordinator
+--    Aggregate node (M3).
+--  * Every other aggregate (sum/min/max/avg, multiple aggregates, GROUP BY,
+--    count(DISTINCT), ...) uses a native Aggregate over the Append of per-replica
+--    Async Foreign Scans: correct, but the raw rows come back and core
+--    aggregates them.
+--
+-- Checks are discriminating: a broken slice map makes the counts wrong, and a
+-- stale/1-slice plan shows fewer than 3 Async Foreign Scan children (native
+-- path) or the wrong Remote SQL (pushed path).
 \i test/loopback-setup.sql
 
 -- Multi-block table so the 3 slices are non-trivial (nblocks >> 3).
@@ -20,31 +26,38 @@ CREATE USER MAPPING FOR CURRENT_USER SERVER agg_srv;
 CREATE FOREIGN TABLE aft (id int, grp int, pad text)
   SERVER agg_srv OPTIONS (table_name 'agg_t', min_blocks_per_slice '1');
 
--- 1. Whole-table aggregates: native Agg over the Append, correct answers.
+-- 1. Whole-table aggregates: correct answers.
 SELECT count(*), sum(id), min(id), max(id), avg(id)::numeric(10,4) FROM aft;
 
--- The plan: a native Aggregate over an Append of 3 Async Foreign Scans; no
--- internal combine, no per-aggregate FDW code.
+-- 2. Bare count(*) is PUSHED DOWN (M3): a Foreign Scan whose remote SQL is
+-- "SELECT count(*)", with no Aggregate node above it.
 EXPLAIN (COSTS OFF) SELECT count(*) FROM aft;
+SELECT count(*) FROM aft;
 
--- 2. The 3 slices actually ran and are disjoint+complete: under ANALYZE the
--- child "actual rows" sum to the full row count, and there are 3 of them.
+-- 3. The native path (any non-count aggregate): a native Aggregate over the
+-- Append of 3 Async Foreign Scans.  Under ANALYZE the child "actual rows" sum
+-- to the full row count, proving the 3 slices are disjoint and complete.
 -- (BUFFERS OFF: PG18+ ANALYZE buffers accounting is noisy.)
+EXPLAIN (COSTS OFF) SELECT sum(id) FROM aft;
 EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF)
-  SELECT count(*) FROM aft;
+  SELECT sum(id) FROM aft;
+SELECT sum(id) FROM aft;
 
--- 3. GROUP BY -- works natively in v2 (impossible to push in v1).
+-- 4. GROUP BY -- native, works in v2 (impossible to push in v1).
 SELECT grp, count(*), sum(id) FROM aft GROUP BY grp ORDER BY grp;
 
--- 4. Aggregate with a WHERE: the shippable qual is pushed into each replica's
--- per-slice query (see qual_pushdown), then core aggregates the survivors.
-SELECT count(*), min(id), max(id) FROM aft WHERE id > 100;
+-- 5. count(*) with a shippable WHERE: still pushed down, with the qual folded
+-- into each replica's remote count(*).
 EXPLAIN (COSTS OFF) SELECT count(*) FROM aft WHERE id > 100;
+SELECT count(*), min(id), max(id) FROM aft WHERE id > 100;
 
--- 5. Reuse across plan shapes in one session: aggregate, then a plain scan.
+-- 6. count(DISTINCT) is NOT the pushable shape -> native path.
+SELECT count(DISTINCT id) FROM aft;
+
+-- 7. Reuse across plan shapes in one session: pushed count, then a plain scan.
 SELECT count(*) FROM aft;
 SELECT id FROM aft ORDER BY id LIMIT 3;
 
--- 6. Self-aggregation via join (exercises overflow connections: two concurrent
--- scans of the same server).
+-- 8. Self-aggregation via join (exercises overflow connections: the pushed
+-- count node and a concurrent scan of the same server).
 SELECT count(*) FROM aft a JOIN aft b USING (id);

@@ -140,6 +140,18 @@ typedef struct RepFdwScanState
 	ReplicaConn *rconn;			/* this node's checked-out connection */
 	bool		my_active;		/* false when my_index >= P (no slice) */
 	bool		my_started;		/* streaming query has been sent */
+
+	/*
+	 * M3 aggregate-combine node (scanrelid==0): this single node fans a
+	 * partial-aggregate query to every replica and combines the partials.
+	 * Distinct from the per-replica scan path above.
+	 */
+	bool		is_agg;			/* this is the aggregate combine node */
+	ReplicaConn **agg_conns;	/* array[agg_nconns] of checked-out conns */
+	char	  **agg_sqls;		/* array[agg_nconns] per-replica partial SQL */
+	RepFdwCtidBound *agg_bounds;	/* array[agg_nconns] ctid bind values */
+	int			agg_nconns;		/* P: participating replicas */
+	bool		agg_done;		/* the single combined row has been emitted */
 } RepFdwScanState;
 
 /* in option.c */

@@ -1,11 +1,17 @@
--- aggregation.sql (v2): aggregation is handled by native PostgreSQL Agg nodes
--- stacked on the Append of per-replica Async Foreign Scans -- not by any
--- internal combine.  This is the v2 architecture (notes/v2-append-architecture.md):
--- each replica streams its own ctid slice concurrently, and core aggregates the
--- union.  GROUP BY / avg / etc. therefore work for free, unlike v1.
+-- aggregation.sql (v2 + M3): two aggregation paths coexist.
 --
--- Checks are discriminating: a broken slice map would make the counts wrong, and
--- a stale/1-slice plan would show fewer than 3 Async Foreign Scan children.
+--  * A bare count(*) (optionally with a shippable WHERE) is PUSHED DOWN: a
+--    scanrelid==0 Foreign Scan fans "SELECT count(*)" to every replica and
+--    combines the partials -- one row per replica on the wire, no coordinator
+--    Aggregate node (M3).
+--  * Every other aggregate (sum/min/max/avg, multiple aggregates, GROUP BY,
+--    count(DISTINCT), ...) uses a native Aggregate over the Append of per-replica
+--    Async Foreign Scans: correct, but the raw rows come back and core
+--    aggregates them.
+--
+-- Checks are discriminating: a broken slice map makes the counts wrong, and a
+-- stale/1-slice plan shows fewer than 3 Async Foreign Scan children (native
+-- path) or the wrong Remote SQL (pushed path).
 \i test/loopback-setup.sql
 -- test/loopback-setup.sql
 --
@@ -35,39 +41,54 @@ CREATE SERVER agg_srv FOREIGN DATA WRAPPER pg_replica_fanout_fdw
 CREATE USER MAPPING FOR CURRENT_USER SERVER agg_srv;
 CREATE FOREIGN TABLE aft (id int, grp int, pad text)
   SERVER agg_srv OPTIONS (table_name 'agg_t', min_blocks_per_slice '1');
--- 1. Whole-table aggregates: native Agg over the Append, correct answers.
+-- 1. Whole-table aggregates: correct answers.
 SELECT count(*), sum(id), min(id), max(id), avg(id)::numeric(10,4) FROM aft;
  count |  sum  | min | max |   avg    
 -------+-------+-----+-----+----------
    400 | 80200 |   1 | 400 | 200.5000
 (1 row)
 
--- The plan: a native Aggregate over an Append of 3 Async Foreign Scans; no
--- internal combine, no per-aggregate FDW code.
+-- 2. Bare count(*) is PUSHED DOWN (M3): a Foreign Scan whose remote SQL is
+-- "SELECT count(*)", with no Aggregate node above it.
 EXPLAIN (COSTS OFF) SELECT count(*) FROM aft;
-                            QUERY PLAN                            
-------------------------------------------------------------------
+                        QUERY PLAN                        
+----------------------------------------------------------
+ Foreign Scan
+   Replicas: 3
+   Remote SQL Template: SELECT count(*) FROM public.agg_t
+(3 rows)
+
+SELECT count(*) FROM aft;
+ count 
+-------
+   400
+(1 row)
+
+-- 3. The native path (any non-count aggregate): a native Aggregate over the
+-- Append of 3 Async Foreign Scans.  Under ANALYZE the child "actual rows" sum
+-- to the full row count, proving the 3 slices are disjoint and complete.
+-- (BUFFERS OFF: PG18+ ANALYZE buffers accounting is noisy.)
+EXPLAIN (COSTS OFF) SELECT sum(id) FROM aft;
+                           QUERY PLAN                           
+----------------------------------------------------------------
  Aggregate
    ->  Append
          ->  Async Foreign Scan on aft
                Replica: 0
                Replicas: 3
-               Remote SQL Template: SELECT NULL FROM public.agg_t
+               Remote SQL Template: SELECT id FROM public.agg_t
          ->  Async Foreign Scan on aft
                Replica: 1
                Replicas: 3
-               Remote SQL Template: SELECT NULL FROM public.agg_t
+               Remote SQL Template: SELECT id FROM public.agg_t
          ->  Async Foreign Scan on aft
                Replica: 2
                Replicas: 3
-               Remote SQL Template: SELECT NULL FROM public.agg_t
+               Remote SQL Template: SELECT id FROM public.agg_t
 (14 rows)
 
--- 2. The 3 slices actually ran and are disjoint+complete: under ANALYZE the
--- child "actual rows" sum to the full row count, and there are 3 of them.
--- (BUFFERS OFF: PG18+ ANALYZE buffers accounting is noisy.)
 EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF)
-  SELECT count(*) FROM aft;
+  SELECT sum(id) FROM aft;
                              QUERY PLAN                             
 --------------------------------------------------------------------
  Aggregate (actual rows=1.00 loops=1)
@@ -75,18 +96,24 @@ EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF)
          ->  Async Foreign Scan on aft (actual rows=128.00 loops=1)
                Replica: 0
                Replicas: 3
-               Remote SQL Template: SELECT NULL FROM public.agg_t
+               Remote SQL Template: SELECT id FROM public.agg_t
          ->  Async Foreign Scan on aft (actual rows=136.00 loops=1)
                Replica: 1
                Replicas: 3
-               Remote SQL Template: SELECT NULL FROM public.agg_t
+               Remote SQL Template: SELECT id FROM public.agg_t
          ->  Async Foreign Scan on aft (actual rows=136.00 loops=1)
                Replica: 2
                Replicas: 3
-               Remote SQL Template: SELECT NULL FROM public.agg_t
+               Remote SQL Template: SELECT id FROM public.agg_t
 (14 rows)
 
--- 3. GROUP BY -- works natively in v2 (impossible to push in v1).
+SELECT sum(id) FROM aft;
+  sum  
+-------
+ 80200
+(1 row)
+
+-- 4. GROUP BY -- native, works in v2 (impossible to push in v1).
 SELECT grp, count(*), sum(id) FROM aft GROUP BY grp ORDER BY grp;
  grp | count |  sum  
 -----+-------+-------
@@ -96,34 +123,30 @@ SELECT grp, count(*), sum(id) FROM aft GROUP BY grp ORDER BY grp;
    3 |   100 | 20100
 (4 rows)
 
--- 4. Aggregate with a WHERE: the shippable qual is pushed into each replica's
--- per-slice query (see qual_pushdown), then core aggregates the survivors.
+-- 5. count(*) with a shippable WHERE: still pushed down, with the qual folded
+-- into each replica's remote count(*).
+EXPLAIN (COSTS OFF) SELECT count(*) FROM aft WHERE id > 100;
+                                      QUERY PLAN                                      
+--------------------------------------------------------------------------------------
+ Foreign Scan
+   Replicas: 3
+   Remote SQL Template: SELECT count(*) FROM public.agg_t WHERE (id > '100'::integer)
+(3 rows)
+
 SELECT count(*), min(id), max(id) FROM aft WHERE id > 100;
  count | min | max 
 -------+-----+-----
    300 | 101 | 400
 (1 row)
 
-EXPLAIN (COSTS OFF) SELECT count(*) FROM aft WHERE id > 100;
-                                          QUERY PLAN                                          
-----------------------------------------------------------------------------------------------
- Aggregate
-   ->  Append
-         ->  Async Foreign Scan on aft
-               Replica: 0
-               Replicas: 3
-               Remote SQL Template: SELECT NULL FROM public.agg_t WHERE (id > '100'::integer)
-         ->  Async Foreign Scan on aft
-               Replica: 1
-               Replicas: 3
-               Remote SQL Template: SELECT NULL FROM public.agg_t WHERE (id > '100'::integer)
-         ->  Async Foreign Scan on aft
-               Replica: 2
-               Replicas: 3
-               Remote SQL Template: SELECT NULL FROM public.agg_t WHERE (id > '100'::integer)
-(14 rows)
+-- 6. count(DISTINCT) is NOT the pushable shape -> native path.
+SELECT count(DISTINCT id) FROM aft;
+ count 
+-------
+   400
+(1 row)
 
--- 5. Reuse across plan shapes in one session: aggregate, then a plain scan.
+-- 7. Reuse across plan shapes in one session: pushed count, then a plain scan.
 SELECT count(*) FROM aft;
  count 
 -------
@@ -138,8 +161,8 @@ SELECT id FROM aft ORDER BY id LIMIT 3;
   3
 (3 rows)
 
--- 6. Self-aggregation via join (exercises overflow connections: two concurrent
--- scans of the same server).
+-- 8. Self-aggregation via join (exercises overflow connections: the pushed
+-- count node and a concurrent scan of the same server).
 SELECT count(*) FROM aft a JOIN aft b USING (id);
  count 
 -------
