@@ -91,7 +91,7 @@ pg_replica_fanout_fdw_handler(PG_FUNCTION_ARGS)
 	routine->IsForeignScanParallelSafe = repfdwIsForeignScanParallelSafe;
 	routine->GetForeignUpperPaths = repfdwGetForeignUpperPaths;
 
-	/* v2 (M0b): async execution -- the Append drives all replicas at once. */
+	/* Async execution: the Append drives all replicas concurrently. */
 	routine->IsForeignPathAsyncCapable = repfdwIsForeignPathAsyncCapable;
 	routine->ForeignAsyncRequest = repfdwForeignAsyncRequest;
 	routine->ForeignAsyncConfigureWait = repfdwForeignAsyncConfigureWait;
@@ -139,13 +139,13 @@ repfdwGetForeignRelSize(PlannerInfo *root, RelOptInfo *baserel,
 	baserel->fdw_private = fpinfo;
 
 	/*
-	 * Size estimate.  A foreign table's own pg_class stats are never populated
+	 * Size estimate. A foreign table's own pg_class stats are never populated
 	 * (ANALYZE is a no-op without AnalyzeForeignTable), so on their own they
 	 * give only default estimates.  But under the same-cluster assumption the
 	 * remote table is a byte-identical physical replica of a table present
 	 * locally in this database -- so we borrow that local copy's size via
 	 * estimate_rel_size (the same logic core uses for a plain table: current
-	 * block count plus reltuples).  This makes baserel->rows accurate, which
+	 * block count plus reltuples). This makes baserel->rows accurate, which
 	 * mainly helps the planner pick good join methods/order and aggregation
 	 * strategies for queries that combine this foreign table with other data.
 	 * If the local table isn't found (or isn't a plain table), fall back to the
@@ -158,6 +158,9 @@ repfdwGetForeignRelSize(PlannerInfo *root, RelOptInfo *baserel,
 		Relation	localrel = OidIsValid(localrelid) ?
 			try_table_open(localrelid, AccessShareLock) : NULL;
 
+		/* Absent if the same-cluster assumption is broken (misconfigured
+		 * schema/table, or the coordinator isn't in the cluster) or a concurrent
+		 * DROP raced us -- fall back to the default estimate. */
 		if (localrel != NULL)
 		{
 			if (localrel->rd_rel->relkind == RELKIND_RELATION)
@@ -179,19 +182,19 @@ repfdwGetForeignRelSize(PlannerInfo *root, RelOptInfo *baserel,
 }
 
 /*
- * repfdwGetForeignPaths (v2 -- M0)
- *		Instead of one fan-out ForeignScan, emit an Append of N per-replica
- *		ForeignScan paths -- one child per replica, each carrying its replica
- *		index in the path's fdw_private.  The core planner then stacks native
- *		Agg/Sort/Join nodes on top of the Append, and (M0b) an async-capable
- *		Append drives all N children concurrently.  create_append_path
- *		explicitly supports a RELOPT_BASEREL parent, and async is gated only on
- *		the FDW routine + per-path capability, never on real partitioning --
- *		see the M0 findings in notes/v2-append-architecture.md.
+ * repfdwGetForeignPaths
+ *		Emit an Append of N per-replica ForeignScan paths -- one child per
+ *		replica, each carrying its replica index in the path's fdw_private.  The
+ *		core planner then stacks native Agg/Sort/Join nodes on top of the Append,
+ *		and an async-capable Append drives all N children concurrently.  This
+ *		works because create_append_path explicitly supports a RELOPT_BASEREL
+ *		parent, and async execution is gated only on the FDW routine plus
+ *		per-path capability, never on real partitioning -- so a plain baserel
+ *		Append is driven asynchronously just like a partitioned one.
  *
- *		Cost note (unchanged from v1): baserel->pages is 0 without ANALYZE, so
- *		the per-replica page-cost division is usually a no-op; don't read the
- *		fan-out benefit off EXPLAIN cost numbers.
+ *		Each child is costed at roughly one replica's share of the scan (page
+ *		and row costs divided by N); the size estimate feeding this comes from
+ *		the co-located local table (see repfdwGetForeignRelSize).
  */
 static void
 repfdwGetForeignPaths(PlannerInfo *root, RelOptInfo *baserel,
@@ -240,12 +243,12 @@ repfdwGetForeignPaths(PlannerInfo *root, RelOptInfo *baserel,
 
 /*
  * repfdwGetForeignUpperPaths
- *		Disabled in v2 (returns immediately): aggregation is handled by native
- *		Agg nodes over the Append of per-replica scans, not by an internal
- *		combine (see repfdwGetForeignPaths and notes/v2-append-architecture.md).
- *		The v1 count(*) upper-path pushdown below is retained, unreached, as the
- *		starting point for M3 remote partial-aggregate pushdown (a per-child
- *		Partial Aggregate + a local Finalize Aggregate).
+ *		Claim the grouped-aggregate upper stage for a bare count(*) (optionally
+ *		with a shippable WHERE) and push it down: each replica computes a partial
+ *		count over its ctid slice and a single foreign node sums the partials
+ *		(see the aggregate branch of repfdwBeginForeignScan).  Any other
+ *		aggregate, GROUP BY, HAVING, or DISTINCT is left for a native Agg node
+ *		over the Append of per-replica scans.
  */
 static void
 repfdwGetForeignUpperPaths(PlannerInfo *root, UpperRelationKind stage,
@@ -261,14 +264,14 @@ repfdwGetForeignUpperPaths(PlannerInfo *root, UpperRelationKind stage,
 	ForeignPath *path;
 
 	/*
-	 * M3: remote aggregate pushdown for the decomposable class.  Because the
-	 * FDW upper-path API yields a single ForeignPath for the *final* grouped
-	 * result (and our FDW-built Append over one baserel never triggers core's
-	 * partitionwise/AGGSPLIT Finalize machinery), a pushed aggregate is a
-	 * scanrelid==0 foreign node that fans a partial-aggregate query to every
-	 * replica and combines the partials itself -- see repfdwBeginForeignScan's
-	 * agg branch and notes/v2-append-architecture.md.  Currently only a bare
-	 * count(*) is recognized; sum/min/max/avg and GROUP BY are follow-ons.
+	 * Why a single combine node rather than native Finalize-over-Append: the
+	 * FDW upper-path API yields one ForeignPath for the *final* grouped result,
+	 * and an FDW-built Append over a single baserel never triggers core's
+	 * partitionwise/AGGSPLIT Finalize machinery -- so a pushed aggregate has to
+	 * be a scanrelid==0 node that fans a partial-aggregate query to every
+	 * replica and combines the partials itself.  Only a bare count(*) is
+	 * recognized here; other decomposable aggregates (sum/min/max/avg) and
+	 * GROUP BY would extend it.
 	 */
 
 	/* 1. Only the plain full-aggregation upper stage; ignore the rest. */
@@ -509,10 +512,10 @@ repfdwGetForeignPlan(PlannerInfo *root, RelOptInfo *baserel,
 										 fpinfo->opts->table_name);
 
 	/*
-	 * v2 (M0): this is one Append child.  Its replica/slice index rides in the
-	 * child ForeignPath's fdw_private (set in repfdwGetForeignPaths); append it
-	 * plus the total replica count to the plan-time fdw_private so
-	 * BeginForeignScan knows which replica it owns and how to slice.
+	 * This is one Append child.  Its replica/slice index rides in the child
+	 * ForeignPath's fdw_private (set in repfdwGetForeignPaths); append it plus
+	 * the total replica count to the plan-time fdw_private so BeginForeignScan
+	 * knows which replica it owns and how to slice.
 	 */
 	fdw_private = list_make5(makeString(sql_template),
 							 retrieved_attrs,
@@ -738,7 +741,7 @@ repfdw_store_next_row(RepFdwScanState *fsstate, TupleTableSlot *slot)
 }
 
 /*
- * repfdwBeginForeignScan (v2 -- M0)
+ * repfdwBeginForeignScan
  *		One Append child = one replica.  Connect the cached replica set, open
  *		the shared remote read-only transaction (idempotent across siblings),
  *		and run this node's slice query synchronously.  Async streaming and
@@ -827,7 +830,7 @@ repfdwBeginForeignScan(ForeignScanState *node, int eflags)
 }
 
 /*
- * repfdwIterateForeignScan (v2 -- M0b, synchronous fallback)
+ * repfdwIterateForeignScan (synchronous fallback)
  *		Return the next row from this child's stream, blocking on its socket as
  *		needed (RepFdwPumpOne).  Used when the scan runs outside an async Append
  *		(e.g. EvalPlanQual); under an async Append the ForeignAsync* callbacks
@@ -887,7 +890,7 @@ repfdwIterateForeignScan(ForeignScanState *node)
 }
 
 /*
- * repfdwReScanForeignScan (v2 -- M0b)
+ * repfdwReScanForeignScan
  *		Cancel/drain any in-flight stream and resend this child's slice query
  *		(the remote snapshot is unchanged, so this is exactly repeatable).
  */
@@ -913,7 +916,7 @@ repfdwReScanForeignScan(ForeignScanState *node)
 }
 
 /*
- * repfdwEndForeignScan (v2 -- M0b)
+ * repfdwEndForeignScan
  *		Cancel/drain this child's in-flight stream so its connection returns to
  *		idle-in-transaction.  The connection and remote transaction are left for
  *		the xact callback to close at local commit/abort.
@@ -946,7 +949,7 @@ repfdwEndForeignScan(ForeignScanState *node)
 /*
  * repfdwIsForeignPathAsyncCapable
  *		Every per-replica child (a baserel scan) is async-capable: that is the
- *		whole point of the v2 Append (all replicas stream at once).  The
+ *		whole point of the Append (all replicas stream at once).  The
  *		aggregate upper path (scanrelid==0, RELOPT_UPPER_REL) fans out and
  *		combines synchronously, so it is not async.
  */
@@ -1067,7 +1070,7 @@ repfdwForeignAsyncNotify(AsyncRequest *areq)
 }
 
 /*
- * repfdwExplainForeignScan (v2 -- M0)
+ * repfdwExplainForeignScan
  *		Per-child EXPLAIN: which replica this scan targets (of how many) and its
  *		remote SQL template.  N such Foreign Scans appear under the Append.
  */

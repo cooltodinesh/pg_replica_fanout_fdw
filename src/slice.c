@@ -16,9 +16,9 @@
  * RepFdwGetNBlocks
  *		Discover the table's size, in blocks, on the given replica connection
  *		(inside its already-open REPEATABLE READ txn, so it's a stable
- *		snapshot read).  In v2 each Append child asks its own replica; physical
- *		replicas share the primary's heap, so all agree (modulo replay lag --
- *		the LSN-consistency caveat documented in notes/v2-append-architecture.md).
+ *		snapshot read).  Each Append child asks its own replica; physical
+ *		replicas share the primary's heap layout, so all agree on the block
+ *		count -- modulo replay lag between replicas (the LSN-consistency caveat).
  */
 BlockNumber
 RepFdwGetNBlocks(ReplicaConn *rconn, const char *schema, const char *table)

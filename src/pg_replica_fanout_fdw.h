@@ -83,7 +83,7 @@ typedef struct ReplicaConn
 	List	   *rowqueue;		/* queued PGresult chunks (PGRES_TUPLES_CHUNK) */
 	int			cur_row;		/* cursor within linitial(rowqueue) */
 	bool		paused;			/* backpressure: temporarily not polled */
-	bool		in_use;			/* checked out by a live scan node (v2) */
+	bool		in_use;			/* checked out by a live scan node */
 } ReplicaConn;
 
 struct RepFdwScanState;
@@ -103,18 +103,20 @@ typedef struct ReplicaSet
 } ReplicaSet;
 
 /*
- * Per-scan-node execution state.  In the v2 Append-of-per-replica-scans model
- * (notes/v2-append-architecture.md) each ForeignScan node owns exactly one
- * replica's connection (rconn) and streams its ctid slice in chunked-rows mode;
- * an async-capable Append drives all N children's sockets concurrently via the
- * ForeignAsync* callbacks, and the same streaming state feeds the synchronous
- * IterateForeignScan fallback.
+ * Per-scan-node execution state.  A scan of a foreign table is an Append of one
+ * ForeignScan per replica: each such node owns exactly one replica's connection
+ * (rconn) and streams its ctid slice in chunked-rows mode, and an async-capable
+ * Append drives all N children's sockets concurrently via the ForeignAsync*
+ * callbacks (the same streaming state also feeds the synchronous
+ * IterateForeignScan fallback).  A pushed-down count(*) instead uses a single
+ * combine node (is_agg) that fans a partial query to every replica -- see the
+ * agg_* fields below.
  *
  * fdw_private (plan -> exec) is the 7-tuple
  *   {sql_template, retrieved_attrs, remote_pred, is_count_agg, foreigntableid,
  *    my_index, nreplicas}
- * (remote_pred is "" not NIL when there is no pushed predicate; is_count_agg is
- * currently always false -- the v1 count combine is disabled in v2).
+ * where remote_pred is "" not NIL when there is no pushed predicate, and
+ * is_count_agg marks the combine node (my_index is -1 there, unused).
  */
 typedef struct RepFdwScanState
 {
@@ -139,7 +141,7 @@ typedef struct RepFdwScanState
 	bool		my_started;		/* streaming query has been sent */
 
 	/*
-	 * M3 aggregate-combine node (scanrelid==0): this single node fans a
+	 * Aggregate-combine node (scanrelid==0): this single node fans a
 	 * partial-aggregate query to every replica and combines the partials.
 	 * Distinct from the per-replica scan path above.
 	 */

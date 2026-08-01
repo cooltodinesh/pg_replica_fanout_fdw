@@ -606,8 +606,8 @@ drain_conn(ReplicaConn *rconn, int fetch_size)
 /*
  * RepFdwStartOneQuery
  *		Send one ctid-bounded slice query on a single replica connection in
- *		chunked-rows streaming mode (v2 async path -- each Append child owns
- *		one connection and drives it independently).
+ *		chunked-rows streaming mode.  Each Append child owns one connection
+ *		and drives it independently.
  */
 void
 RepFdwStartOneQuery(ReplicaConn *rconn, const char *sql,

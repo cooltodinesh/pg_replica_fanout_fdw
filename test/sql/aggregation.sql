@@ -1,9 +1,9 @@
--- aggregation.sql (v2 + M3): two aggregation paths coexist.
+-- aggregation.sql: two aggregation paths coexist.
 --
 --  * A bare count(*) (optionally with a shippable WHERE) is PUSHED DOWN: a
 --    scanrelid==0 Foreign Scan fans "SELECT count(*)" to every replica and
 --    combines the partials -- one row per replica on the wire, no coordinator
---    Aggregate node (M3).
+--    Aggregate node.
 --  * Every other aggregate (sum/min/max/avg, multiple aggregates, GROUP BY,
 --    count(DISTINCT), ...) uses a native Aggregate over the Append of per-replica
 --    Async Foreign Scans: correct, but the raw rows come back and core
@@ -29,7 +29,7 @@ CREATE FOREIGN TABLE aft (id int, grp int, pad text)
 -- 1. Whole-table aggregates: correct answers.
 SELECT count(*), sum(id), min(id), max(id), avg(id)::numeric(10,4) FROM aft;
 
--- 2. Bare count(*) is PUSHED DOWN (M3): a Foreign Scan whose remote SQL is
+-- 2. Bare count(*) is PUSHED DOWN: a Foreign Scan whose remote SQL is
 -- "SELECT count(*)", with no Aggregate node above it.
 EXPLAIN (COSTS OFF) SELECT count(*) FROM aft;
 SELECT count(*) FROM aft;
@@ -43,7 +43,7 @@ EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF)
   SELECT sum(id) FROM aft;
 SELECT sum(id) FROM aft;
 
--- 4. GROUP BY -- native, works in v2 (impossible to push in v1).
+-- 4. GROUP BY -- handled natively by an Aggregate over the Append.
 SELECT grp, count(*), sum(id) FROM aft GROUP BY grp ORDER BY grp;
 
 -- 5. count(*) with a shippable WHERE: still pushed down, with the qual folded
