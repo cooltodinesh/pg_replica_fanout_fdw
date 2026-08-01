@@ -14,6 +14,8 @@
 #include "access/htup_details.h"
 #include "access/table.h"
 #include "access/tupdesc.h"
+#include "catalog/namespace.h"
+#include "catalog/pg_class.h"
 #include "commands/explain_format.h"
 #include "commands/explain_state.h"
 #include "executor/execAsync.h"
@@ -27,6 +29,7 @@
 #include "optimizer/cost.h"
 #include "optimizer/optimizer.h"
 #include "optimizer/pathnode.h"
+#include "optimizer/plancat.h"
 #include "optimizer/planmain.h"
 #include "optimizer/restrictinfo.h"
 #include "optimizer/tlist.h"
@@ -136,13 +139,42 @@ repfdwGetForeignRelSize(PlannerInfo *root, RelOptInfo *baserel,
 	baserel->fdw_private = fpinfo;
 
 	/*
-	 * Estimate from ordinary pg_class stats, like a plain table.  For a foreign
-	 * table those stats are only populated by ANALYZE, which is a no-op here --
-	 * we don't implement AnalyzeForeignTable -- so in practice relpages/reltuples
-	 * are defaults and these row/width estimates are rough (see the cost-model
-	 * note in repfdwGetForeignPaths).  We accept that rather than pay a
-	 * planning-time round-trip to size the remote table.
+	 * Size estimate.  A foreign table's own pg_class stats are never populated
+	 * (ANALYZE is a no-op without AnalyzeForeignTable), so on their own they
+	 * give only default estimates.  But under the same-cluster assumption the
+	 * remote table is a byte-identical physical replica of a table present
+	 * locally in this database -- so we borrow that local copy's size via
+	 * estimate_rel_size (the same logic core uses for a plain table: current
+	 * block count plus reltuples).  This makes baserel->rows accurate, which
+	 * mainly helps the planner pick good join methods/order and aggregation
+	 * strategies for queries that combine this foreign table with other data.
+	 * If the local table isn't found (or isn't a plain table), fall back to the
+	 * default estimate.
 	 */
+	{
+		Oid			nspoid = get_namespace_oid(fpinfo->opts->schema_name, true);
+		Oid			localrelid = OidIsValid(nspoid) ?
+			get_relname_relid(fpinfo->opts->table_name, nspoid) : InvalidOid;
+		Relation	localrel = OidIsValid(localrelid) ?
+			try_table_open(localrelid, AccessShareLock) : NULL;
+
+		if (localrel != NULL)
+		{
+			if (localrel->rd_rel->relkind == RELKIND_RELATION)
+			{
+				BlockNumber pages;
+				double		tuples;
+				double		allvisfrac;
+
+				estimate_rel_size(localrel, NULL, &pages, &tuples, &allvisfrac);
+				baserel->pages = pages;
+				baserel->tuples = tuples;
+				baserel->allvisfrac = allvisfrac;
+			}
+			table_close(localrel, AccessShareLock);
+		}
+	}
+
 	set_baserel_size_estimates(root, baserel);
 }
 
