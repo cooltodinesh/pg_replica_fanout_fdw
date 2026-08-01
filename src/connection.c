@@ -44,9 +44,6 @@ static void ensure_connected(ReplicaSet *rset, RepFdwOptions *opts,
 							  UserMapping *user);
 static PGconn *start_connect(ReplicaConn *rconn, RepFdwOptions *opts,
 							  UserMapping *user);
-static void begin_conn_xact(ReplicaConn *rconn);
-static PGconn *connect_one(const char *host, int port, RepFdwOptions *opts,
-						   UserMapping *user);
 static void abort_pending_connects(ReplicaSet *rset);
 static void drain_conn(ReplicaConn *rconn, int fetch_size);
 static void destroy_replicaset_conns(ReplicaSet *rset);
@@ -121,7 +118,6 @@ RepFdwGetConnections(UserMapping *user, RepFdwOptions *opts)
 		MemoryContext oldcxt;
 
 		rset->nconns = nconns;
-		rset->overflow_conns = NIL;
 		rset->xact_open = false;
 		rset->invalidated = false;
 		rset->server_hashvalue =
@@ -251,7 +247,6 @@ static void
 destroy_replicaset_conns(ReplicaSet *rset)
 {
 	int			i;
-	ListCell   *lc_over;
 
 	for (i = 0; i < rset->nconns; i++)
 	{
@@ -271,24 +266,6 @@ destroy_replicaset_conns(ReplicaSet *rset)
 		if (rconn->host != NULL)
 			pfree(rconn->host);
 	}
-
-	/* Overflow conns are normally torn down at xact end; be defensive. */
-	foreach(lc_over, rset->overflow_conns)
-	{
-		ReplicaConn *oc = (ReplicaConn *) lfirst(lc_over);
-		ListCell   *lc;
-
-		if (oc->conn != NULL)
-			libpqsrv_disconnect(oc->conn);
-		foreach(lc, oc->rowqueue)
-			PQclear((PGresult *) lfirst(lc));
-		list_free(oc->rowqueue);
-		if (oc->host != NULL)
-			pfree(oc->host);
-		pfree(oc);
-	}
-	list_free(rset->overflow_conns);
-	rset->overflow_conns = NIL;
 
 	if (rset->conns != NULL)
 		pfree(rset->conns);
@@ -493,142 +470,30 @@ RepFdwBeginRemoteXact(ReplicaSet *rset)
 }
 
 /*
- * begin_conn_xact
- *		Open a REPEATABLE READ READ ONLY transaction on a single connection
- *		(used for overflow connections created mid-transaction).
- */
-static void
-begin_conn_xact(ReplicaConn *rconn)
-{
-	PGresult   *res = libpqsrv_exec(rconn->conn,
-									"BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY",
-									we_stream);
-
-	if (res == NULL || PQresultStatus(res) != PGRES_COMMAND_OK)
-		RepFdwReportError(res, rconn,
-						  "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY");
-	PQclear(res);
-	rconn->state = REP_IN_TXN;
-}
-
-/*
- * connect_one
- *		Blockingly (but interruptibly) connect one new replica connection to
- *		host:port and return it CONNECTION_OK; ereport(ERROR) on failure.  Used
- *		for overflow connections; the cached primaries are still connected
- *		concurrently in ensure_connected().
- */
-static PGconn *
-connect_one(const char *host, int port, RepFdwOptions *opts, UserMapping *user)
-{
-	const char *keywords[12];
-	const char *values[12];
-	char		portbuf[16];
-	char		timeoutbuf[16];
-	int			n = 0;
-	ListCell   *lc;
-	PGconn	   *conn;
-
-	snprintf(portbuf, sizeof(portbuf), "%d", port);
-	snprintf(timeoutbuf, sizeof(timeoutbuf), "%d", opts->connect_timeout);
-
-	keywords[n] = "host";
-	values[n++] = host;
-	keywords[n] = "port";
-	values[n++] = portbuf;
-	keywords[n] = "dbname";
-	values[n++] = opts->dbname;
-	keywords[n] = "application_name";
-	values[n++] = opts->application_name;
-	keywords[n] = "connect_timeout";
-	values[n++] = timeoutbuf;
-
-	foreach(lc, user->options)
-	{
-		DefElem    *def = (DefElem *) lfirst(lc);
-
-		if (strcmp(def->defname, "user") == 0)
-		{
-			keywords[n] = "user";
-			values[n++] = defGetString(def);
-		}
-		else if (strcmp(def->defname, "password") == 0)
-		{
-			keywords[n] = "password";
-			values[n++] = defGetString(def);
-		}
-	}
-
-	keywords[n] = "fallback_application_name";
-	values[n++] = "pg_replica_fanout_fdw";
-	keywords[n] = NULL;
-	values[n] = NULL;
-
-	conn = libpqsrv_connect_params(keywords, values, false, we_connect);
-	if (conn == NULL || PQstatus(conn) != CONNECTION_OK)
-	{
-		char	   *msg = conn ? pchomp(PQerrorMessage(conn)) : "out of memory";
-
-		if (conn != NULL)
-			libpqsrv_disconnect(conn);
-		ereport(ERROR,
-				(errcode(ERRCODE_SQLCLIENT_UNABLE_TO_ESTABLISH_SQLCONNECTION),
-				 errmsg("could not connect to replica \"%s:%d\"", host, port),
-				 errdetail_internal("%s", msg)));
-	}
-	PQsetNoticeReceiver(conn, libpqsrv_notice_receiver, "pg_replica_fanout_fdw");
-	return conn;
-}
-
-/*
  * RepFdwCheckoutConn
- *		Claim a connection to replica `index` for one live scan node, with its
- *		remote REPEATABLE READ transaction open.  Reuses the cached primary if
- *		idle; otherwise reuses (or creates) an overflow connection -- so two
- *		concurrently live scans of the same server (e.g. a self-join) each get
- *		their own connection instead of colliding on one.
+ *		Claim replica `index`'s connection for one live scan node.  Each replica
+ *		has exactly one cached connection, so only one scan of a server can be
+ *		live at a time: the N sibling children of a single Append claim distinct
+ *		indexes, but a *second* concurrent scan (a self-join, or a join of two
+ *		foreign tables on the same server) would collide on an already-claimed
+ *		connection -- we raise a clear error rather than support that in this
+ *		first iteration.
  */
 ReplicaConn *
-RepFdwCheckoutConn(ReplicaSet *rset, RepFdwOptions *opts, UserMapping *user,
-				   int index)
+RepFdwCheckoutConn(ReplicaSet *rset, int index, const char *servername)
 {
 	ReplicaConn *primary = &rset->conns[index];
-	ReplicaConn *oc;
-	ListCell   *lc;
-	MemoryContext oldcxt;
 
-	/* 1. The cached primary, if idle (its xact was opened by BeginRemoteXact). */
-	if (!primary->in_use)
-	{
-		primary->in_use = true;
-		return primary;
-	}
+	if (primary->in_use)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("pg_replica_fanout_fdw cannot run two concurrent scans on foreign server \"%s\"",
+						servername),
+				 errdetail("Each replica connection runs one query at a time, so only one scan of this server can be live at once."),
+				 errhint("Rewrite so a single scan of this server is active at a time (e.g. materialize one side with a CTE, or place the tables on separate servers).")));
 
-	/* 2. An idle overflow connection to the same replica, if any. */
-	foreach(lc, rset->overflow_conns)
-	{
-		oc = (ReplicaConn *) lfirst(lc);
-		if (oc->index == index && !oc->in_use && oc->state != REP_DEAD)
-		{
-			oc->in_use = true;
-			return oc;
-		}
-	}
-
-	/* 3. Create a new overflow connection (tracked for xact-end cleanup). */
-	oldcxt = MemoryContextSwitchTo(RepFdwCacheContext);
-	oc = palloc0_object(ReplicaConn);
-	oc->index = index;
-	oc->host = pstrdup(primary->host);
-	oc->port = primary->port;
-	oc->rowqueue = NIL;
-	rset->overflow_conns = lappend(rset->overflow_conns, oc);
-	MemoryContextSwitchTo(oldcxt);
-
-	oc->conn = connect_one(oc->host, oc->port, opts, user);
-	begin_conn_xact(oc);
-	oc->in_use = true;
-	return oc;
+	primary->in_use = true;
+	return primary;
 }
 
 /*
@@ -986,7 +851,6 @@ pgreplicafdw_xact_callback(XactEvent event, void *arg)
 	while ((rset = (ReplicaSet *) hash_seq_search(&scan)) != NULL)
 	{
 		int			i;
-		ListCell   *lc_over;
 
 		if (rset->xact_open)
 		{
@@ -1042,50 +906,6 @@ pgreplicafdw_xact_callback(XactEvent event, void *arg)
 				else if (rconn->state != REP_DEAD)
 					rconn->state = REP_IN_TXN;
 			}
-
-			/*
-			 * Tear down any overflow connections (created by RepFdwCheckoutConn
-			 * for concurrently live scans): close their remote xact and
-			 * disconnect -- they are per-local-xact, not cached across
-			 * statements.
-			 */
-			foreach(lc_over, rset->overflow_conns)
-			{
-				ReplicaConn *oc = (ReplicaConn *) lfirst(lc_over);
-				ListCell   *lc2;
-
-				if (oc->conn != NULL && oc->state != REP_DEAD)
-				{
-					PGresult   *res;
-
-					if (event == XACT_EVENT_PRE_COMMIT)
-					{
-						res = libpqsrv_exec(oc->conn, "COMMIT", we_stream);
-						if (res)
-							PQclear(res);
-					}
-					else if (event == XACT_EVENT_ABORT)
-					{
-						if (oc->state == REP_STREAMING)
-							(void) libpqsrv_cancel(oc->conn,
-												   TimestampTzPlusMilliseconds(GetCurrentTimestamp(), 5000));
-						res = libpqsrv_exec(oc->conn, "ROLLBACK", we_stream);
-						if (res)
-							PQclear(res);
-					}
-				}
-
-				foreach(lc2, oc->rowqueue)
-					PQclear((PGresult *) lfirst(lc2));
-				list_free(oc->rowqueue);
-				if (oc->conn != NULL)
-					libpqsrv_disconnect(oc->conn);
-				if (oc->host != NULL)
-					pfree(oc->host);
-				pfree(oc);
-			}
-			list_free(rset->overflow_conns);
-			rset->overflow_conns = NIL;
 
 			rset->xact_open = false;
 		}

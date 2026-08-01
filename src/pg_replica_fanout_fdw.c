@@ -559,15 +559,16 @@ repfdw_agg_send(RepFdwScanState *fsstate)
 }
 
 static void
-repfdw_agg_start(RepFdwScanState *fsstate, RepFdwOptions *opts, UserMapping *user)
+repfdw_agg_start(RepFdwScanState *fsstate, const char *servername)
 {
+	RepFdwOptions *opts = fsstate->opts;
 	ReplicaConn *c0;
 	BlockNumber nblocks;
 	int			P;
 	int			i;
 
 	/* Replica 0's connection tells us nblocks; it is also slice 0. */
-	c0 = RepFdwCheckoutConn(fsstate->rset, opts, user, 0);
+	c0 = RepFdwCheckoutConn(fsstate->rset, 0, servername);
 	nblocks = RepFdwGetNBlocks(c0, opts->schema_name, opts->table_name);
 	P = RepFdwComputeSlices(nblocks, fsstate->nreplicas,
 							opts->min_blocks_per_slice, &fsstate->agg_bounds);
@@ -579,7 +580,7 @@ repfdw_agg_start(RepFdwScanState *fsstate, RepFdwOptions *opts, UserMapping *use
 	for (i = 0; i < P; i++)
 	{
 		fsstate->agg_conns[i] = (i == 0) ? c0 :
-			RepFdwCheckoutConn(fsstate->rset, opts, user, i);
+			RepFdwCheckoutConn(fsstate->rset, i, servername);
 		fsstate->agg_sqls[i] = RepFdwBuildBoundedSql(fsstate->sql_template,
 													 fsstate->remote_pred,
 													 &fsstate->agg_bounds[i]);
@@ -764,17 +765,17 @@ repfdwBeginForeignScan(ForeignScanState *node, int eflags)
 		 * partial query to every replica now.
 		 */
 		node->fdw_state = fsstate;
-		repfdw_agg_start(fsstate, opts, user);
+		repfdw_agg_start(fsstate, server->servername);
 		return;
 	}
 
 	/*
-	 * Per-replica Append child.  Claim its own connection to its replica; two
-	 * concurrently live scans of the same server (e.g. a self-join) get
-	 * distinct connections (cached primary + overflow) instead of colliding.
+	 * Per-replica Append child.  Claim its replica's connection; a second
+	 * concurrent scan of the same server (e.g. a self-join) collides here and
+	 * gets a clean error (see RepFdwCheckoutConn).
 	 */
-	fsstate->rconn = RepFdwCheckoutConn(fsstate->rset, opts, user,
-										fsstate->my_index);
+	fsstate->rconn = RepFdwCheckoutConn(fsstate->rset, fsstate->my_index,
+										server->servername);
 	fsstate->attinmeta =
 		TupleDescGetAttInMetadata(RelationGetDescr(node->ss.ss_currentRelation));
 	fsstate->row_cxt = AllocSetContextCreate(CurrentMemoryContext,

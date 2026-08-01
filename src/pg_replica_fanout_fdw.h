@@ -33,11 +33,11 @@ typedef struct RepFdwCtidBound
 	char	   *hi;			/* tid literal "(block,0)", or NULL */
 } RepFdwCtidBound;
 
-/* parsed FDW options, valid for the duration of planning or of one scan */
+/* parsed FDW options, valid for the duration of planning of one scan */
 typedef struct RepFdwOptions
 {
 	List	   *replicas;		/* list of RepHostPort *, order = replica index */
-	char	   *dbname;			/* NULL => coordinator's current database */
+	char	   *dbname;			/* coordinator's current database */
 	int			fetch_size;
 	int			connect_timeout;	/* seconds */
 	char	   *application_name;
@@ -92,12 +92,8 @@ typedef struct ReplicaSet
 {
 	Oid			umid;			/* hash key, must be first */
 	int			nconns;
-	ReplicaConn *conns;			/* array[nconns]: the cached "primary" conn per
-								 * replica, reused across statements */
-	List	   *overflow_conns; /* extra ReplicaConn * created when a replica's
-								 * primary is already in use by a concurrently
-								 * live scan (e.g. a self-join); torn down at
-								 * local xact end (v2) */
+	ReplicaConn *conns;			/* array[nconns]: one cached conn per replica,
+								 * reused across statements */
 	bool		xact_open;		/* remote REPEATABLE READ READ ONLY open on all */
 	uint32		server_hashvalue;	/* GetSysCacheHashValue1(FOREIGNSERVEROID) */
 	uint32		mapping_hashvalue;	/* GetSysCacheHashValue1(USERMAPPINGOID) */
@@ -161,8 +157,8 @@ extern List *RepFdwParseReplicas(const char *replicas_str);
 /* in connection.c */
 extern ReplicaSet *RepFdwGetConnections(UserMapping *user, RepFdwOptions *opts);
 extern void RepFdwBeginRemoteXact(ReplicaSet *rset);
-extern ReplicaConn *RepFdwCheckoutConn(ReplicaSet *rset, RepFdwOptions *opts,
-									   UserMapping *user, int index);
+extern ReplicaConn *RepFdwCheckoutConn(ReplicaSet *rset, int index,
+									   const char *servername);
 extern void RepFdwReturnConn(ReplicaConn *rconn);
 extern int	RepFdwQueuedRowCount(ReplicaConn *rconn);
 extern void RepFdwStartOneQuery(ReplicaConn *rconn, const char *sql,

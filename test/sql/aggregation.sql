@@ -58,6 +58,6 @@ SELECT count(DISTINCT id) FROM aft;
 SELECT count(*) FROM aft;
 SELECT id FROM aft ORDER BY id LIMIT 3;
 
--- 8. Self-aggregation via join (exercises overflow connections: the pushed
--- count node and a concurrent scan of the same server).
+-- 8. Two concurrent scans of the same server (self-join) are rejected in this
+-- iteration -- one connection per replica, so the second scan collides.
 SELECT count(*) FROM aft a JOIN aft b USING (id);

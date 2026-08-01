@@ -161,11 +161,9 @@ SELECT id FROM aft ORDER BY id LIMIT 3;
   3
 (3 rows)
 
--- 8. Self-aggregation via join (exercises overflow connections: the pushed
--- count node and a concurrent scan of the same server).
+-- 8. Two concurrent scans of the same server (self-join) are rejected in this
+-- iteration -- one connection per replica, so the second scan collides.
 SELECT count(*) FROM aft a JOIN aft b USING (id);
- count 
--------
-   400
-(1 row)
-
+ERROR:  pg_replica_fanout_fdw cannot run two concurrent scans on foreign server "agg_srv"
+DETAIL:  Each replica connection runs one query at a time, so only one scan of this server can be live at once.
+HINT:  Rewrite so a single scan of this server is active at a time (e.g. materialize one side with a CTE, or place the tables on separate servers).
