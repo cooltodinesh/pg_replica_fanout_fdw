@@ -25,7 +25,7 @@ SELECT count(*) FROM small_ft a JOIN small_ft b USING (id);
 
 -- validator: missing required "replicas" option
 CREATE SERVER v_missing_replicas FOREIGN DATA WRAPPER pg_replica_fanout_fdw
-  OPTIONS (dbname 'postgres');
+  OPTIONS (application_name 'test');
 
 -- validator: consistency 'lsn' rejected (only 'none' is supported)
 CREATE SERVER v_bad_consistency FOREIGN DATA WRAPPER pg_replica_fanout_fdw

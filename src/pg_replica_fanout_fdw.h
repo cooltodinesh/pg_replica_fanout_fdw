@@ -37,7 +37,8 @@ typedef struct RepFdwCtidBound
 typedef struct RepFdwOptions
 {
 	List	   *replicas;		/* list of RepHostPort *, order = replica index */
-	char	   *dbname;			/* coordinator's current database */
+	char	   *dbname;			/* always this session's database (same-cluster
+								 * assumption); not a user option */
 	int			fetch_size;
 	int			connect_timeout;	/* seconds */
 	char	   *application_name;

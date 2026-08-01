@@ -33,7 +33,6 @@ typedef struct RepFdwValidOption
 
 static const RepFdwValidOption valid_options[] = {
 	{"replicas", ForeignServerRelationId},
-	{"dbname", ForeignServerRelationId},
 	{"fetch_size", ForeignServerRelationId},
 	{"connect_timeout", ForeignServerRelationId},
 	{"application_name", ForeignServerRelationId},
@@ -259,8 +258,6 @@ RepFdwGetOptions(Oid foreigntableid, RepFdwOptions **opts_out)
 			opts->replicas = RepFdwParseReplicas(defGetString(def));
 			have_replicas = true;
 		}
-		else if (strcmp(def->defname, "dbname") == 0)
-			opts->dbname = defGetString(def);
 		else if (strcmp(def->defname, "fetch_size") == 0)
 			opts->fetch_size = parse_positive_int_option(def);
 		else if (strcmp(def->defname, "connect_timeout") == 0)
@@ -276,8 +273,11 @@ RepFdwGetOptions(Oid foreigntableid, RepFdwOptions **opts_out)
 				 errmsg("foreign server \"%s\" is missing required option \"replicas\"",
 						server->servername)));
 
-	if (opts->dbname == NULL)
-		opts->dbname = get_database_name(MyDatabaseId);
+	/*
+	 * The coordinator is assumed to be an instance of the same cluster as the
+	 * replicas, so the replicas' database is simply this session's database.
+	 */
+	opts->dbname = get_database_name(MyDatabaseId);
 
 	opts->schema_name = get_namespace_name(get_rel_namespace(foreigntableid));
 	opts->table_name = get_rel_name(foreigntableid);

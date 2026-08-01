@@ -48,7 +48,7 @@ HINT:  Rewrite so a single scan of this server is active at a time (e.g. materia
 -- legal -- see slicing.sql for the full rescan test.
 -- validator: missing required "replicas" option
 CREATE SERVER v_missing_replicas FOREIGN DATA WRAPPER pg_replica_fanout_fdw
-  OPTIONS (dbname 'postgres');
+  OPTIONS (application_name 'test');
 ERROR:  option "replicas" is required for a pg_replica_fanout_fdw server
 -- validator: consistency 'lsn' rejected (only 'none' is supported)
 CREATE SERVER v_bad_consistency FOREIGN DATA WRAPPER pg_replica_fanout_fdw
@@ -59,4 +59,4 @@ HINT:  consistency='lsn' not supported; only 'none' is valid.
 CREATE SERVER v_bad_option FOREIGN DATA WRAPPER pg_replica_fanout_fdw
   OPTIONS (replicas 'localhost', bogus 'x');
 ERROR:  invalid option "bogus"
-HINT:  Valid options in this context: replicas, dbname, fetch_size, connect_timeout, application_name, consistency
+HINT:  Valid options in this context: replicas, fetch_size, connect_timeout, application_name, consistency

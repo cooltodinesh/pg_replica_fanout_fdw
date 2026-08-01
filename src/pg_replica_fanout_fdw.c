@@ -100,7 +100,7 @@ pg_replica_fanout_fdw_handler(PG_FUNCTION_ARGS)
 /*
  * repfdwGetForeignRelSize
  *		Parse options, estimate size from local stats, and record which
- *		columns will need to be fetched.  Classify each baserestrictinfo
+ *		columns will need to be fetched. Classify each baserestrictinfo
  *		entry as shippable (remote_conds) or not (local_conds) -- see
  *		RepFdwIsForeignQual for the shippability rule.
  */
@@ -135,7 +135,14 @@ repfdwGetForeignRelSize(PlannerInfo *root, RelOptInfo *baserel,
 
 	baserel->fdw_private = fpinfo;
 
-	/* Rely on ordinary pg_class stats, like a plain table would. */
+	/*
+	 * Estimate from ordinary pg_class stats, like a plain table.  For a foreign
+	 * table those stats are only populated by ANALYZE, which is a no-op here --
+	 * we don't implement AnalyzeForeignTable -- so in practice relpages/reltuples
+	 * are defaults and these row/width estimates are rough (see the cost-model
+	 * note in repfdwGetForeignPaths).  We accept that rather than pay a
+	 * planning-time round-trip to size the remote table.
+	 */
 	set_baserel_size_estimates(root, baserel);
 }
 
