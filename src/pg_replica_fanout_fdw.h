@@ -33,6 +33,27 @@ typedef struct RepFdwCtidBound
 	char	   *hi;			/* tid literal "(block,0)", or NULL */
 } RepFdwCtidBound;
 
+/*
+ * How a scan of one foreign table is executed, chosen once during planning
+ * (see repfdwGetForeignRelSize) from the query's shape and what the local
+ * planner would do with the co-located copy.  The partition dimension and the
+ * per-replica predicate are a single coherent choice per mode: the ctid bound
+ * is emitted ONLY in CTID_SLICE -- a keyed mode that also carried a ctid bound
+ * would silently drop rows.
+ */
+typedef enum RepFdwFanoutMode
+{
+	REPFDW_MODE_CTID_SLICE = 0,	/* fan out; each replica scans a heap block
+								 * range of its slice (default) */
+	REPFDW_MODE_SERVE_LOCAL,	/* no fan-out; answer from the co-located local
+								 * table, whose planner picks an index scan */
+	REPFDW_MODE_VALUE_SPLIT,	/* fan out; partition a large IN (=ANY) list of
+								 * values across replicas, no ctid bound */
+} RepFdwFanoutMode;
+
+/* human-readable mode name for EXPLAIN */
+extern const char *RepFdwModeName(RepFdwFanoutMode mode);
+
 /* parsed FDW options, valid for the duration of planning of one scan */
 typedef struct RepFdwOptions
 {
@@ -54,6 +75,7 @@ typedef struct RepFdwPlanState
 	RepFdwOptions *opts;
 	Oid			foreigntableid;
 	Bitmapset  *attrs_used;	/* columns needed, encoded like pull_varattnos() */
+	RepFdwFanoutMode mode;	/* execution mode chosen in GetForeignRelSize */
 	bool		is_count_agg;	/* set by GetForeignUpperPaths on the upper
 								 * (GROUP_AGG) rel's copy of this struct;
 								 * read back by GetForeignPlan */
@@ -112,17 +134,21 @@ typedef struct ReplicaSet
  * combine node (is_agg) that fans a partial query to every replica -- see the
  * agg_* fields below.
  *
- * fdw_private (plan -> exec) is the 7-tuple
+ * fdw_private (plan -> exec) is the 8-tuple
  *   {sql_template, retrieved_attrs, remote_pred, is_count_agg, foreigntableid,
- *    my_index, nreplicas}
- * where remote_pred is "" not NIL when there is no pushed predicate, and
- * is_count_agg marks the combine node (my_index is -1 there, unused).
+ *    my_index, nreplicas, mode}
+ * where remote_pred is "" not NIL when there is no pushed predicate,
+ * is_count_agg marks the combine node (my_index is -1 there, unused), and mode
+ * is a RepFdwFanoutMode.  In VALUE_SPLIT remote_pred is this child's own
+ * value-chunk predicate; in SERVE_LOCAL the node runs remote_pred against the
+ * local table and there is no fan-out.
  */
 typedef struct RepFdwScanState
 {
 	ReplicaSet *rset;
 	RepFdwOptions *opts;
 	Oid			foreigntableid;
+	RepFdwFanoutMode mode;		/* execution mode (see RepFdwFanoutMode) */
 	char	   *sql_template;	/* "SELECT ... FROM ...", no WHERE yet */
 	List	   *retrieved_attrs;	/* ascending attnums fetched from replicas */
 	char	   *remote_pred;	/* pushed-down WHERE predicate, no leading
@@ -151,6 +177,15 @@ typedef struct RepFdwScanState
 	RepFdwCtidBound *agg_bounds;	/* array[agg_nconns] ctid bind values */
 	int			agg_nconns;		/* P: participating replicas */
 	bool		agg_done;		/* the single combined row has been emitted */
+
+	/*
+	 * Serve-local node (mode == REPFDW_MODE_SERVE_LOCAL): the query is run once
+	 * against the co-located local table via SPI and its rows materialized here
+	 * (held in batch_cxt); no replica connection is used.
+	 */
+	HeapTuple  *local_tuples;	/* array[local_ntuples], in batch_cxt */
+	int64		local_ntuples;
+	int64		local_cur;		/* cursor into local_tuples */
 } RepFdwScanState;
 
 /* in option.c */

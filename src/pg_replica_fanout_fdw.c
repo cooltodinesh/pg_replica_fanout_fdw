@@ -47,6 +47,25 @@ PG_MODULE_MAGIC_EXT(
 
 PG_FUNCTION_INFO_V1(pg_replica_fanout_fdw_handler);
 
+/*
+ * RepFdwModeName
+ *		Human-readable name of a fan-out mode, for EXPLAIN.
+ */
+const char *
+RepFdwModeName(RepFdwFanoutMode mode)
+{
+	switch (mode)
+	{
+		case REPFDW_MODE_CTID_SLICE:
+			return "ctid-slice fan-out";
+		case REPFDW_MODE_SERVE_LOCAL:
+			return "serve-local";
+		case REPFDW_MODE_VALUE_SPLIT:
+			return "value-split fan-out";
+	}
+	return "unknown";
+}
+
 static void repfdwGetForeignRelSize(PlannerInfo *root, RelOptInfo *baserel,
 									 Oid foreigntableid);
 static void repfdwGetForeignPaths(PlannerInfo *root, RelOptInfo *baserel,
@@ -444,6 +463,8 @@ repfdwGetForeignPlan(PlannerInfo *root, RelOptInfo *baserel,
 		fdw_private = lappend(fdw_private, makeInteger(-1));
 		fdw_private = lappend(fdw_private,
 							  makeInteger(list_length(fpinfo->opts->replicas)));
+		fdw_private = lappend(fdw_private,
+							  makeInteger(REPFDW_MODE_CTID_SLICE));
 
 		return make_foreignscan(tlist,
 								NIL,	/* no local exprs */
@@ -526,6 +547,7 @@ repfdwGetForeignPlan(PlannerInfo *root, RelOptInfo *baserel,
 						  makeInteger(intVal(linitial(best_path->fdw_private))));
 	fdw_private = lappend(fdw_private,
 						  makeInteger(list_length(fpinfo->opts->replicas)));
+	fdw_private = lappend(fdw_private, makeInteger(fpinfo->mode));
 
 	return make_foreignscan(tlist,
 							scan_clauses,
@@ -791,6 +813,7 @@ repfdwBeginForeignScan(ForeignScanState *node, int eflags)
 	fsstate->is_agg = is_count_agg;
 	fsstate->my_index = intVal(list_nth(fdw_private, 5));
 	fsstate->nreplicas = intVal(list_nth(fdw_private, 6));
+	fsstate->mode = (RepFdwFanoutMode) intVal(list_nth(fdw_private, 7));
 
 	fsstate->rset = RepFdwGetConnections(user, opts);
 	RepFdwBeginRemoteXact(fsstate->rset);
@@ -1084,6 +1107,30 @@ repfdwExplainForeignScan(ForeignScanState *node, ExplainState *es)
 	bool		is_count_agg = boolVal(lfourth(fdw_private));
 	int			my_index = intVal(list_nth(fdw_private, 5));
 	int			nreplicas = intVal(list_nth(fdw_private, 6));
+	RepFdwFanoutMode mode = (RepFdwFanoutMode) intVal(list_nth(fdw_private, 7));
+
+	/*
+	 * The default ctid-slice fan-out is the norm and prints no mode line (so
+	 * existing plans are unchanged); serve-local and value-split call
+	 * themselves out.
+	 */
+	if (mode != REPFDW_MODE_CTID_SLICE)
+		ExplainPropertyText("Fanout Mode", RepFdwModeName(mode), es);
+
+	/*
+	 * A serve-local node is a single scan of the local table -- no replica
+	 * fan-out -- so the per-replica index lines don't apply.
+	 */
+	if (mode == REPFDW_MODE_SERVE_LOCAL)
+	{
+		if (remote_pred[0] != '\0')
+			ExplainPropertyText("Local SQL",
+								psprintf("%s WHERE %s", sql_template, remote_pred),
+								es);
+		else
+			ExplainPropertyText("Local SQL", sql_template, es);
+		return;
+	}
 
 	/* Per-child scan shows its replica index; the agg node fans to all. */
 	if (!is_count_agg)
