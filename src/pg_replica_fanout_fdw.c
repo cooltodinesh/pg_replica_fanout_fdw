@@ -19,6 +19,7 @@
 #include "commands/explain_format.h"
 #include "commands/explain_state.h"
 #include "executor/execAsync.h"
+#include "executor/spi.h"
 #include "executor/tuptable.h"
 #include "foreign/fdwapi.h"
 #include "foreign/foreign.h"
@@ -26,6 +27,7 @@
 #include "miscadmin.h"
 #include "nodes/bitmapset.h"
 #include "nodes/makefuncs.h"
+#include "nodes/plannodes.h"
 #include "optimizer/cost.h"
 #include "optimizer/optimizer.h"
 #include "optimizer/pathnode.h"
@@ -33,10 +35,12 @@
 #include "optimizer/planmain.h"
 #include "optimizer/restrictinfo.h"
 #include "optimizer/tlist.h"
+#include "tcop/tcopprot.h"
 #include "utils/builtins.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "utils/rel.h"
+#include "utils/snapmgr.h"
 
 #include "pg_replica_fanout_fdw.h"
 
@@ -120,11 +124,125 @@ pg_replica_fanout_fdw_handler(PG_FUNCTION_ARGS)
 }
 
 /*
+ * repfdw_plan_scan_is_indexed
+ *		Plan (but do not execute) sql -- a scan of the co-located *local* table
+ *		with this query's shippable quals -- and report whether the local
+ *		planner's chosen access path is index-driven (Index / Index-Only /
+ *		Bitmap Heap Scan) rather than a plain block scan (Seq / TID Range).
+ *
+ *		This is the oracle for serve-local: the local instance has the same
+ *		indexes and full column statistics as the replicas, so its access-method
+ *		choice is the faithful signal for "would fan-out just duplicate an index
+ *		scan?" -- something a foreign rel's own costing can never surface,
+ *		because core never builds an index path on a foreign table.
+ *
+ *		The probe is conservative: it selects all columns (so a covering
+ *		index-only scan may show as a regular index scan or, if the qual isn't
+ *		selective enough, as a seq scan), which at worst mislabels a serve-local
+ *		candidate as fan-out -- never the reverse, and never a wrong answer.
+ */
+static bool
+repfdw_plan_scan_is_indexed(const char *sql)
+{
+	List	   *parsetree_list;
+	List	   *querytree_list;
+	RawStmt    *raw;
+	Query	   *query;
+	PlannedStmt *plan;
+	Plan	   *scan;
+	bool		pushed_snapshot = false;
+	bool		result = false;
+
+	parsetree_list = pg_parse_query(sql);
+	if (list_length(parsetree_list) != 1)
+		return false;
+	raw = linitial_node(RawStmt, parsetree_list);
+	querytree_list = pg_analyze_and_rewrite_fixedparams(raw, sql, NULL, 0, NULL);
+	if (list_length(querytree_list) != 1)
+		return false;
+	query = linitial_node(Query, querytree_list);
+	if (query->commandType != CMD_SELECT)
+		return false;
+
+	if (!ActiveSnapshotSet())
+	{
+		PushActiveSnapshot(GetTransactionSnapshot());
+		pushed_snapshot = true;
+	}
+
+	plan = pg_plan_query(query, sql, 0 /* cursorOptions */ , NULL, NULL);
+
+	/* Peel wrapper nodes (Gather/Result/Limit/Sort/...) down to the base scan. */
+	scan = plan->planTree;
+	while (scan != NULL)
+	{
+		if (IsA(scan, IndexScan) || IsA(scan, IndexOnlyScan) ||
+			IsA(scan, BitmapHeapScan))
+		{
+			result = true;
+			break;
+		}
+		if (IsA(scan, SeqScan) || IsA(scan, TidRangeScan) || IsA(scan, TidScan))
+			break;
+		scan = scan->lefttree;
+	}
+
+	if (pushed_snapshot)
+		PopActiveSnapshot();
+
+	return result;
+}
+
+/*
+ * repfdw_choose_mode
+ *		Decide how a scan of this foreign table will execute (see
+ *		RepFdwFanoutMode).  A scan with no shippable qual has nothing an index
+ *		could serve, so it fans out (CTID_SLICE).  Otherwise, if the co-located
+ *		local table is present, ask the local planner (repfdw_plan_scan_is_indexed)
+ *		whether it would use an index; if so, serve the whole query locally
+ *		rather than fan out and duplicate the index scan N times.
+ *
+ *		local_ok is false when the co-located table isn't present as a plain
+ *		table (a broken same-cluster assumption or a raced DROP); then we can't
+ *		probe, and fall back to fan-out.
+ */
+static RepFdwFanoutMode
+repfdw_choose_mode(RepFdwPlanState *fpinfo, bool local_ok)
+{
+	List	   *remote_exprs = NIL;
+	ListCell   *lc;
+	char	   *pred;
+	char	   *sql;
+
+	if (fpinfo->remote_conds == NIL || !local_ok)
+		return REPFDW_MODE_CTID_SLICE;
+
+	foreach(lc, fpinfo->remote_conds)
+		remote_exprs = lappend(remote_exprs,
+							   ((RestrictInfo *) lfirst(lc))->clause);
+	pred = RepFdwDeparseQuals(fpinfo->foreigntableid, remote_exprs);
+	if (pred == NULL)
+		return REPFDW_MODE_CTID_SLICE;
+
+	sql = psprintf("SELECT * FROM %s WHERE %s",
+				   quote_qualified_identifier(fpinfo->opts->schema_name,
+											  fpinfo->opts->table_name),
+				   pred);
+
+	if (repfdw_plan_scan_is_indexed(sql))
+		return REPFDW_MODE_SERVE_LOCAL;
+
+	return REPFDW_MODE_CTID_SLICE;
+}
+
+/*
  * repfdwGetForeignRelSize
  *		Parse options, estimate size from local stats, and record which
  *		columns will need to be fetched. Classify each baserestrictinfo
  *		entry as shippable (remote_conds) or not (local_conds) -- see
- *		RepFdwIsForeignQual for the shippability rule.
+ *		RepFdwIsForeignQual for the shippability rule.  Finally choose the
+ *		execution mode (repfdw_choose_mode) from what the local planner would
+ *		do with the co-located copy.
  */
 static void
 repfdwGetForeignRelSize(PlannerInfo *root, RelOptInfo *baserel,
@@ -176,6 +294,7 @@ repfdwGetForeignRelSize(PlannerInfo *root, RelOptInfo *baserel,
 			get_relname_relid(fpinfo->opts->table_name, nspoid) : InvalidOid;
 		Relation	localrel = OidIsValid(localrelid) ?
 			try_table_open(localrelid, AccessShareLock) : NULL;
+		bool		local_ok = false;
 
 		/* Absent if the same-cluster assumption is broken (misconfigured
 		 * schema/table, or the coordinator isn't in the cluster) or a concurrent
@@ -192,9 +311,13 @@ repfdwGetForeignRelSize(PlannerInfo *root, RelOptInfo *baserel,
 				baserel->pages = pages;
 				baserel->tuples = tuples;
 				baserel->allvisfrac = allvisfrac;
+				local_ok = true;
 			}
 			table_close(localrel, AccessShareLock);
 		}
+
+		/* Choose the execution mode now that remote_conds is classified. */
+		fpinfo->mode = repfdw_choose_mode(fpinfo, local_ok);
 	}
 
 	set_baserel_size_estimates(root, baserel);
@@ -225,6 +348,30 @@ repfdwGetForeignPaths(PlannerInfo *root, RelOptInfo *baserel,
 	List	   *subpaths = NIL;
 	AppendPathInput input;
 	int			i;
+
+	/*
+	 * Serve-local: a single ForeignScan of the co-located local table, no
+	 * Append and no fan-out.  The sentinel replica index -1 (unused at exec)
+	 * also marks the path async-incapable (see repfdwIsForeignPathAsyncCapable).
+	 */
+	if (fpinfo->mode == REPFDW_MODE_SERVE_LOCAL)
+	{
+		Cost		total_cost = cpu_tuple_cost * clamp_row_est(baserel->rows);
+
+		add_path(baserel, (Path *)
+				 create_foreignscan_path(root, baserel,
+										 NULL,	/* default pathtarget */
+										 baserel->rows,
+										 0, /* disabled_nodes */
+										 0, /* startup_cost */
+										 total_cost,
+										 NIL,	/* no pathkeys */
+										 baserel->lateral_relids,
+										 NULL,	/* no outer plan */
+										 NIL,	/* no fdw_restrictinfo */
+										 list_make1(makeInteger(-1))));
+		return;
+	}
 
 	for (i = 0; i < nreplicas; i++)
 	{
@@ -599,6 +746,68 @@ repfdw_run_slice_query(RepFdwScanState *fsstate)
 }
 
 /*
+ * repfdw_run_local_query
+ *		Serve-local execution (mode == REPFDW_MODE_SERVE_LOCAL): run the query
+ *		against the co-located *local* table via SPI -- the local planner picks
+ *		the index scan -- and materialize its rows into batch_cxt.  No replica
+ *		connection is used and nothing is sent remotely.  The remote predicate
+ *		is param-free (only immutable Const-based quals are shippable), so the
+ *		materialized set is stable across rescans (see repfdwReScanForeignScan).
+ */
+static void
+repfdw_run_local_query(RepFdwScanState *fsstate)
+{
+	RepFdwCtidBound nobound = {NULL, NULL};
+	char	   *sql = RepFdwBuildBoundedSql(fsstate->sql_template,
+										   fsstate->remote_pred, &nobound);
+	int			natts = fsstate->attinmeta->tupdesc->natts;
+	uint64		n;
+	TupleDesc	spidesc;
+	MemoryContext oldcxt;
+	uint64		r;
+
+	if (SPI_connect() != SPI_OK_CONNECT)
+		elog(ERROR, "pg_replica_fanout_fdw: SPI_connect failed");
+
+	if (SPI_execute(sql, true /* read_only */ , 0) != SPI_OK_SELECT)
+		elog(ERROR, "pg_replica_fanout_fdw: local query failed: %s", sql);
+
+	n = SPI_processed;
+	spidesc = SPI_tuptable->tupdesc;
+
+	/*
+	 * Build one full-width heap tuple per row (only retrieved_attrs are
+	 * populated, the rest NULL -- exactly as the remote path does in
+	 * repfdw_store_next_row) into batch_cxt, so they outlive SPI_finish.
+	 */
+	oldcxt = MemoryContextSwitchTo(fsstate->batch_cxt);
+	fsstate->local_tuples = (HeapTuple *) palloc(sizeof(HeapTuple) * Max(n, 1));
+	for (r = 0; r < n; r++)
+	{
+		HeapTuple	srctup = SPI_tuptable->vals[r];
+		char	  **values = (char **) palloc0(sizeof(char *) * natts);
+		int			j = 1;
+		ListCell   *lc;
+
+		foreach(lc, fsstate->retrieved_attrs)
+		{
+			int			attnum = lfirst_int(lc);
+
+			values[attnum - 1] = SPI_getvalue(srctup, spidesc, j);
+			j++;
+		}
+		fsstate->local_tuples[r] = BuildTupleFromCStrings(fsstate->attinmeta,
+														  values);
+	}
+	MemoryContextSwitchTo(oldcxt);
+
+	fsstate->local_ntuples = n;
+	fsstate->local_cur = 0;
+
+	SPI_finish();
+}
+
+/*
  * repfdw_agg_start
  *		Set up the aggregate combine node (scanrelid==0): discover nblocks,
  *		compute the P slices, check out one connection per participating
@@ -815,12 +1024,26 @@ repfdwBeginForeignScan(ForeignScanState *node, int eflags)
 	fsstate->nreplicas = intVal(list_nth(fdw_private, 6));
 	fsstate->mode = (RepFdwFanoutMode) intVal(list_nth(fdw_private, 7));
 
-	fsstate->rset = RepFdwGetConnections(user, opts);
-	RepFdwBeginRemoteXact(fsstate->rset);
-
 	fsstate->batch_cxt = AllocSetContextCreate(CurrentMemoryContext,
 											   "pg_replica_fanout_fdw batch",
 											   ALLOCSET_DEFAULT_SIZES);
+
+	/*
+	 * Serve-local: answer from the co-located local table, no replica set and
+	 * no remote transaction.  scan_relid != 0 here, so ss_currentRelation (and
+	 * thus attinmeta) is available, same as a per-replica child.
+	 */
+	if (fsstate->mode == REPFDW_MODE_SERVE_LOCAL)
+	{
+		fsstate->attinmeta = TupleDescGetAttInMetadata(
+			RelationGetDescr(node->ss.ss_currentRelation));
+		node->fdw_state = fsstate;
+		repfdw_run_local_query(fsstate);
+		return;
+	}
+
+	fsstate->rset = RepFdwGetConnections(user, opts);
+	RepFdwBeginRemoteXact(fsstate->rset);
 
 	if (fsstate->is_agg)
 	{
@@ -865,6 +1088,19 @@ repfdwIterateForeignScan(ForeignScanState *node)
 	RepFdwScanState *fsstate = (RepFdwScanState *) node->fdw_state;
 	TupleTableSlot *slot = node->ss.ss_ScanTupleSlot;
 	ReplicaConn *rconn;
+
+	/* Serve-local: hand back the next pre-materialized local tuple. */
+	if (fsstate->mode == REPFDW_MODE_SERVE_LOCAL)
+	{
+		if (fsstate->local_cur >= fsstate->local_ntuples)
+		{
+			ExecClearTuple(slot);
+			return slot;
+		}
+		ExecStoreHeapTuple(fsstate->local_tuples[fsstate->local_cur++],
+						   slot, false);
+		return slot;
+	}
 
 	/* Aggregate combine node: gather all replicas' partials, emit one row. */
 	if (fsstate->is_agg)
@@ -925,6 +1161,16 @@ repfdwReScanForeignScan(ForeignScanState *node)
 	if (fsstate == NULL)
 		return;
 
+	/*
+	 * Serve-local: the materialized set is param-free and stable, so a rescan
+	 * just rewinds the cursor (no re-execution).
+	 */
+	if (fsstate->mode == REPFDW_MODE_SERVE_LOCAL)
+	{
+		fsstate->local_cur = 0;
+		return;
+	}
+
 	if (fsstate->is_agg)
 	{
 		/* Resend the partials on the already-checked-out connections. */
@@ -979,7 +1225,18 @@ repfdwEndForeignScan(ForeignScanState *node)
 static bool
 repfdwIsForeignPathAsyncCapable(ForeignPath *path)
 {
-	return ((Path *) path)->parent->reloptkind == RELOPT_BASEREL;
+	if (((Path *) path)->parent->reloptkind != RELOPT_BASEREL)
+		return false;
+
+	/*
+	 * The serve-local single path carries the sentinel replica index -1: it is
+	 * one standalone scan of the local table, not fanned out under an Append,
+	 * so it is not async.  Per-replica children carry index >= 0.
+	 */
+	if (intVal(linitial(path->fdw_private)) < 0)
+		return false;
+
+	return true;
 }
 
 /*

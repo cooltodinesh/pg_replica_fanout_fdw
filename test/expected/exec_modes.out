@@ -1,0 +1,152 @@
+-- exec_modes.sql: the execution mode for a scan is chosen from what the local
+-- planner would do with the co-located copy.  A selective qual an index serves
+-- is answered locally (no fan-out, no remote); a full scan or a non-selective
+-- qual fans out across the replicas by ctid slice.
+--
+-- Correctness is identical either way (serve-local and fan-out are two ways to
+-- compute the same rows); these checks are about *which* plan is chosen and
+-- that the chosen plan still returns the right rows.
+\i test/loopback-setup.sql
+-- test/loopback-setup.sql
+--
+-- Shared setup for the loopback regress suites: point all three "replicas"
+-- at the same local instance.  Disjoint ctid slices still union to exactly
+-- the whole table, so slicing/fan-out/merge are fully exercised on one
+-- instance.  Idempotent, safe to \i at the top of any suite.
+-- Idempotent by design (IF NOT EXISTS throughout, no DROP/CASCADE): this
+-- file is \i'd at the top of every suite, and suites run sequentially
+-- against the same regression database.
+CREATE EXTENSION IF NOT EXISTS pg_replica_fanout_fdw;
+psql:test/loopback-setup.sql:10: NOTICE:  extension "pg_replica_fanout_fdw" already exists, skipping
+CREATE SERVER IF NOT EXISTS loopback FOREIGN DATA WRAPPER pg_replica_fanout_fdw
+  OPTIONS (replicas 'localhost:5432,localhost:5432,localhost:5432',
+           consistency 'none');
+psql:test/loopback-setup.sql:14: NOTICE:  server "loopback" already exists, skipping
+CREATE USER MAPPING IF NOT EXISTS FOR CURRENT_USER SERVER loopback;
+psql:test/loopback-setup.sql:16: NOTICE:  user mapping for "user" already exists for server "loopback", skipping
+-- A multi-block table with a btree index on id.  id is unique and highly
+-- selective (equality picks one row of 5000 -> index scan); val is unindexed.
+CREATE TABLE mode_t (id int, val int, pad text);
+INSERT INTO mode_t
+  SELECT g, g % 100, repeat('x', 60) FROM generate_series(1, 5000) g;
+CREATE INDEX mode_t_id_idx ON mode_t (id);
+ANALYZE mode_t;
+DROP SERVER IF EXISTS mode_srv CASCADE;
+NOTICE:  server "mode_srv" does not exist, skipping
+CREATE SERVER mode_srv FOREIGN DATA WRAPPER pg_replica_fanout_fdw
+  OPTIONS (replicas 'localhost:5432,localhost:5432,localhost:5432',
+           consistency 'none');
+CREATE USER MAPPING FOR CURRENT_USER SERVER mode_srv;
+CREATE FOREIGN TABLE mode_ft (id int, val int, pad text)
+  SERVER mode_srv OPTIONS (table_name 'mode_t', min_blocks_per_slice '1');
+-- 1. A selective qual on the indexed column: the local planner uses the index,
+-- so the whole scan is served locally -- a single Foreign Scan with
+-- "Fanout Mode: serve-local" and a "Local SQL" line, no Append, no per-replica
+-- children.
+EXPLAIN (COSTS OFF) SELECT id, val FROM mode_ft WHERE id = 42;
+                                QUERY PLAN                                 
+---------------------------------------------------------------------------
+ Foreign Scan on mode_ft
+   Fanout Mode: serve-local
+   Local SQL: SELECT id, val FROM public.mode_t WHERE (id = '42'::integer)
+(3 rows)
+
+-- ...and it returns the right row.
+SELECT id, val FROM mode_ft WHERE id = 42;
+ id | val 
+----+-----
+ 42 |  42
+(1 row)
+
+-- 2. A selective range on the indexed column is also served locally.
+EXPLAIN (COSTS OFF) SELECT id, val FROM mode_ft WHERE id BETWEEN 10 AND 13;
+                                              QUERY PLAN                                              
+------------------------------------------------------------------------------------------------------
+ Foreign Scan on mode_ft
+   Fanout Mode: serve-local
+   Local SQL: SELECT id, val FROM public.mode_t WHERE (id >= '10'::integer) AND (id <= '13'::integer)
+(3 rows)
+
+SELECT id, val FROM mode_ft WHERE id BETWEEN 10 AND 13 ORDER BY id;
+ id | val 
+----+-----
+ 10 |  10
+ 11 |  11
+ 12 |  12
+ 13 |  13
+(4 rows)
+
+-- 3. A full scan (no shippable qual) has nothing for an index to serve, so it
+-- fans out: an Append of per-replica Async Foreign Scans, no mode line.
+EXPLAIN (COSTS OFF) SELECT id FROM mode_ft ORDER BY id LIMIT 3;
+                              QUERY PLAN                               
+-----------------------------------------------------------------------
+ Limit
+   ->  Sort
+         Sort Key: id
+         ->  Append
+               ->  Async Foreign Scan on mode_ft
+                     Replica: 0
+                     Replicas: 3
+                     Remote SQL Template: SELECT id FROM public.mode_t
+               ->  Async Foreign Scan on mode_ft
+                     Replica: 1
+                     Replicas: 3
+                     Remote SQL Template: SELECT id FROM public.mode_t
+               ->  Async Foreign Scan on mode_ft
+                     Replica: 2
+                     Replicas: 3
+                     Remote SQL Template: SELECT id FROM public.mode_t
+(16 rows)
+
+-- 4. A non-selective qual (val >= 0 matches every row, and val is unindexed):
+-- the local planner picks a seq scan, so a row scan fans out too -- the probe
+-- correctly declines serve-local when an index wouldn't help.  (The qual is
+-- still pushed into each per-replica template.)
+EXPLAIN (COSTS OFF) SELECT id FROM mode_ft WHERE val >= 0;
+                                      QUERY PLAN                                       
+---------------------------------------------------------------------------------------
+ Append
+   ->  Async Foreign Scan on mode_ft
+         Replica: 0
+         Replicas: 3
+         Remote SQL Template: SELECT id FROM public.mode_t WHERE (val >= '0'::integer)
+   ->  Async Foreign Scan on mode_ft
+         Replica: 1
+         Replicas: 3
+         Remote SQL Template: SELECT id FROM public.mode_t WHERE (val >= '0'::integer)
+   ->  Async Foreign Scan on mode_ft
+         Replica: 2
+         Replicas: 3
+         Remote SQL Template: SELECT id FROM public.mode_t WHERE (val >= '0'::integer)
+(13 rows)
+
+SELECT count(*) FROM mode_ft WHERE val >= 0;
+ count 
+-------
+  5000
+(1 row)
+
+-- 5. Rescan: a serve-local scan as the inner of a nested loop is rewound once
+-- per outer row and must return its rows every time (cursor reset, no
+-- re-execution).  Three outer rows x the one matching inner row = 3.
+SELECT count(*)
+  FROM generate_series(1, 3) g,
+       LATERAL (SELECT id FROM mode_ft WHERE id = 42) s;
+ count 
+-------
+     3
+(1 row)
+
+-- 6. Serve-local result equals fan-out result for the same predicate: force a
+-- fan-out of the same rows via a non-shippable duplicate of the qual and
+-- compare.  (id = 42 is shippable -> serve-local; id = 42 AND id + 0 = 42 keeps
+-- the shippable id = 42, so still serve-local -- so instead compare against the
+-- local table directly.)
+SELECT (SELECT id FROM mode_ft WHERE id = 42)
+     = (SELECT id FROM mode_t  WHERE id = 42) AS serve_local_matches_local;
+ serve_local_matches_local 
+---------------------------
+ t
+(1 row)
+
