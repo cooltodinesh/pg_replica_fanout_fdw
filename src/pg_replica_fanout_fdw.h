@@ -169,13 +169,11 @@ extern void RepFdwStartOneQuery(ReplicaConn *rconn, const char *sql,
 extern void RepFdwDrainConn(ReplicaConn *rconn, int fetch_size);
 extern void RepFdwPumpOne(ReplicaConn *rconn, int fetch_size);
 extern void RepFdwCancelDrainOne(ReplicaConn *rconn);
-extern PGresult *RepFdwExecSync(ReplicaConn *rconn, const char *sql);
 pg_noreturn extern void RepFdwReportError(PGresult *res, ReplicaConn *rconn,
 										   const char *sql);
 
 /* in slice.c */
-extern BlockNumber RepFdwGetNBlocks(ReplicaConn *rconn, const char *schema,
-									 const char *table);
+extern BlockNumber RepFdwGetNBlocks(const char *schema, const char *table);
 extern int	RepFdwComputeSlices(BlockNumber nblocks, int nconns,
 								 int min_blocks_per_slice,
 								 RepFdwCtidBound **bounds_out);

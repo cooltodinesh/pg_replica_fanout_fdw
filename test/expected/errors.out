@@ -33,14 +33,15 @@ CREATE FOREIGN TABLE err_ft (id int)
   SERVER bad_loopback OPTIONS (table_name 'err_t');
 SELECT * FROM err_ft;
 ERROR:  timed out connecting to replica(s): 10.255.255.1:5999
--- a query-level remote error (missing relation) on an otherwise-healthy
--- connection must not kill it: the next query on the same session must
--- still succeed on the reused connection, not pay for a reconnect.
+-- A missing table is caught at the coordinator: the co-located local copy
+-- drives the ctid slice bounds, so its absence fails fast with a clear local
+-- error before any remote work.  The session must stay healthy afterwards --
+-- the next query still succeeds, no reconnect.
 CREATE FOREIGN TABLE missing_ft (id int)
   SERVER loopback OPTIONS (table_name 'does_not_exist');
 SELECT * FROM missing_ft;
-ERROR:  relation "public.does_not_exist" does not exist
-CONTEXT:  remote SQL command (replica localhost:5432): SELECT pg_relation_size('public.does_not_exist'::regclass)
+ERROR:  local table "public.does_not_exist" not found
+DETAIL:  The coordinator must be an instance of the same cluster as the replicas, with this table present locally; its heap block count drives the ctid slice bounds.
 SELECT count(*) FROM small_ft;
  count 
 -------

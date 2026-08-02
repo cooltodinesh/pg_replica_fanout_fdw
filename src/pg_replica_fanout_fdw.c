@@ -225,7 +225,7 @@ repfdwGetForeignPaths(PlannerInfo *root, RelOptInfo *baserel,
 										baserel->lateral_relids,
 										NULL,	/* no outer plan */
 										NIL,	/* no fdw_restrictinfo */
-										list_make1(makeInteger(i)));
+										list_make1(makeInteger(i)));  /* replica index for ctid slice */
 		subpaths = lappend(subpaths, child);
 	}
 
@@ -540,8 +540,8 @@ repfdwGetForeignPlan(PlannerInfo *root, RelOptInfo *baserel,
 /*
  * repfdw_run_slice_query
  *		Kick off this Append child's slice query on its own replica connection
- *		in chunked-rows streaming mode (non-blocking send).  Discovers nblocks
- *		from this node's replica, computes the P disjoint slices, and -- if
+ *		in chunked-rows streaming mode (non-blocking send).  Reads nblocks from
+ *		the co-located local table, computes the P disjoint slices, and -- if
  *		this node's index is within P -- sends "SELECT ... WHERE <ctid slice>".
  *		A node whose index is >= P (fewer blocks than replicas) is idle and
  *		returns no rows.  The rows are drained later, concurrently across all
@@ -556,7 +556,7 @@ repfdw_run_slice_query(RepFdwScanState *fsstate)
 	int			P;
 	char	   *sql;
 
-	nblocks = RepFdwGetNBlocks(rconn, fsstate->opts->schema_name,
+	nblocks = RepFdwGetNBlocks(fsstate->opts->schema_name,
 							   fsstate->opts->table_name);
 	P = RepFdwComputeSlices(nblocks, fsstate->nreplicas,
 							fsstate->opts->min_blocks_per_slice, &bounds);
@@ -609,9 +609,9 @@ repfdw_agg_start(RepFdwScanState *fsstate, const char *servername)
 	int			P;
 	int			i;
 
-	/* Replica 0's connection tells us nblocks; it is also slice 0. */
+	/* nblocks comes from the co-located local table; c0 is slice 0. */
+	nblocks = RepFdwGetNBlocks(opts->schema_name, opts->table_name);
 	c0 = RepFdwCheckoutConn(fsstate->rset, 0, servername);
-	nblocks = RepFdwGetNBlocks(c0, opts->schema_name, opts->table_name);
 	P = RepFdwComputeSlices(nblocks, fsstate->nreplicas,
 							opts->min_blocks_per_slice, &fsstate->agg_bounds);
 

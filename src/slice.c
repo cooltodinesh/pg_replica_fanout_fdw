@@ -7,46 +7,62 @@
  */
 #include "postgres.h"
 
-#include "lib/stringinfo.h"
-#include "utils/builtins.h"
+#include "access/table.h"
+#include "catalog/namespace.h"
+#include "catalog/pg_class.h"
+#include "storage/bufmgr.h"
+#include "utils/lsyscache.h"
+#include "utils/rel.h"
 
 #include "pg_replica_fanout_fdw.h"
 
 /*
  * RepFdwGetNBlocks
- *		Discover the table's size, in blocks, on the given replica connection
- *		(inside its already-open REPEATABLE READ txn, so it's a stable
- *		snapshot read).  Each Append child asks its own replica; physical
- *		replicas share the primary's heap layout, so all agree on the block
- *		count -- modulo replay lag between replicas (the LSN-consistency caveat).
+ *		Return the table's size in blocks, read from the co-located *local* copy
+ *		rather than from a replica.  The coordinator is itself an instance of the
+ *		cluster, so this table is always present locally as a byte-identical
+ *		physical replica of the remote heaps -- they share the primary's exact
+ *		block layout.  Reading the size locally (a cheap in-process smgr lookup)
+ *		avoids a network round trip that would otherwise hit a possibly-remote
+ *		replica just to size, and gives every Append child one authoritative
+ *		block count, so their ctid slice boundaries provably line up (a single
+ *		divisor, no gaps or overlaps).  The one caveat is unchanged in kind:
+ *		replay lag between this local copy and a given replica's heap (the
+ *		LSN-consistency caveat), now anchored to the local instance.
+ *
+ *		The local table is a hard requirement of this design, not a costing
+ *		nicety: nblocks defines the ctid ranges, so a missing or non-ordinary
+ *		local table is an error, never a silent fallback.
  */
 BlockNumber
-RepFdwGetNBlocks(ReplicaConn *rconn, const char *schema, const char *table)
+RepFdwGetNBlocks(const char *schema, const char *table)
 {
-	char	   *qualified = quote_qualified_identifier(schema, table);
-	char	   *literal = quote_literal_cstr(qualified);
-	StringInfoData sql;
-	PGresult   *res;
-	int64		bytes;
+	Oid			nspoid = get_namespace_oid(schema, true);
+	Oid			relid = OidIsValid(nspoid) ?
+		get_relname_relid(table, nspoid) : InvalidOid;
+	Relation	rel;
 	BlockNumber nblocks;
 
-	initStringInfo(&sql);
-	appendStringInfo(&sql, "SELECT pg_relation_size(%s::regclass)", literal);
-
-	res = RepFdwExecSync(rconn, sql.data);
-
-	if (PQntuples(res) != 1 || PQgetisnull(res, 0, 0))
-	{
-		PQclear(res);
+	if (!OidIsValid(relid))
 		ereport(ERROR,
-				(errmsg("could not determine size of \"%s\" on replica \"%s:%d\"",
-						qualified, rconn->host, rconn->port)));
-	}
+				(errcode(ERRCODE_UNDEFINED_TABLE),
+				 errmsg("local table \"%s.%s\" not found",
+						schema, table),
+				 errdetail("The coordinator must be an instance of the same "
+						   "cluster as the replicas, with this table present "
+						   "locally; its heap block count drives the ctid slice "
+						   "bounds.")));
 
-	bytes = strtoll(PQgetvalue(res, 0, 0), NULL, 10);
-	PQclear(res);
+	rel = table_open(relid, AccessShareLock);
 
-	nblocks = (BlockNumber) (bytes / BLCKSZ);
+	if (rel->rd_rel->relkind != RELKIND_RELATION)
+		ereport(ERROR,
+				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
+				 errmsg("local relation \"%s.%s\" is not an ordinary table",
+						schema, table)));
+
+	nblocks = RelationGetNumberOfBlocks(rel);
+	table_close(rel, AccessShareLock);
 	return nblocks;
 }
 

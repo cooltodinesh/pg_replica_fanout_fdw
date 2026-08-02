@@ -19,9 +19,10 @@ CREATE FOREIGN TABLE err_ft (id int)
 
 SELECT * FROM err_ft;
 
--- a query-level remote error (missing relation) on an otherwise-healthy
--- connection must not kill it: the next query on the same session must
--- still succeed on the reused connection, not pay for a reconnect.
+-- A missing table is caught at the coordinator: the co-located local copy
+-- drives the ctid slice bounds, so its absence fails fast with a clear local
+-- error before any remote work.  The session must stay healthy afterwards --
+-- the next query still succeeds, no reconnect.
 CREATE FOREIGN TABLE missing_ft (id int)
   SERVER loopback OPTIONS (table_name 'does_not_exist');
 

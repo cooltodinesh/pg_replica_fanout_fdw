@@ -512,24 +512,6 @@ RepFdwReturnConn(ReplicaConn *rconn)
 }
 
 /*
- * RepFdwExecSync
- *		Run one non-streaming command/query on a replica and return its
- *		result, interruptibly.  ereport(ERROR) on any failure.
- */
-PGresult *
-RepFdwExecSync(ReplicaConn *rconn, const char *sql)
-{
-	PGresult   *res = libpqsrv_exec(rconn->conn, sql, we_stream);
-
-	if (res == NULL ||
-		(PQresultStatus(res) != PGRES_COMMAND_OK &&
-		 PQresultStatus(res) != PGRES_TUPLES_OK))
-		RepFdwReportError(res, rconn, sql);
-
-	return res;
-}
-
-/*
  * RepFdwQueuedRowCount
  *		Number of not-yet-consumed rows currently buffered for a replica.
  */
