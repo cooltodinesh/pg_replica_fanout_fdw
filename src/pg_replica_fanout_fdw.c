@@ -194,13 +194,26 @@ repfdw_plan_scan_is_indexed(const char *sql)
 }
 
 /*
+ * Minimum distinct-value count for an IN-list to be worth splitting across
+ * replicas.  Below this the per-replica connection and merge overhead outweighs
+ * parallelizing a handful of index probes, so a small IN is served locally.
+ */
+#define REPFDW_VALUE_SPLIT_MIN 8
+
+/*
  * repfdw_choose_mode
  *		Decide how a scan of this foreign table will execute (see
  *		RepFdwFanoutMode).  A scan with no shippable qual has nothing an index
  *		could serve, so it fans out (CTID_SLICE).  Otherwise, if the co-located
  *		local table is present, ask the local planner (repfdw_plan_scan_is_indexed)
- *		whether it would use an index; if so, serve the whole query locally
- *		rather than fan out and duplicate the index scan N times.
+ *		whether it would use an index:
+ *
+ *		  - not index-served -> fan out by ctid slice (block scan territory);
+ *		  - index-served and the whole qual is one large IN-list -> split that
+ *		    value list across replicas (each does a real index scan on its
+ *		    subset), which parallelizes the index probing a single node can't;
+ *		  - index-served otherwise -> serve the whole query locally, since a
+ *		    selective index lookup is already fast on one node.
  *
  *		local_ok is false when the co-located table isn't present as a plain
  *		table (a broken same-cluster assumption or a raced DROP); then we can't
@@ -213,6 +226,8 @@ repfdw_choose_mode(RepFdwPlanState *fpinfo, bool local_ok)
 	ListCell   *lc;
 	char	   *pred;
 	char	   *sql;
+	ScalarArrayOpExpr *saoe;
+	int			nreplicas;
 
 	if (fpinfo->remote_conds == NIL || !local_ok)
 		return REPFDW_MODE_CTID_SLICE;
@@ -229,10 +244,17 @@ repfdw_choose_mode(RepFdwPlanState *fpinfo, bool local_ok)
 											  fpinfo->opts->table_name),
 				   pred);
 
-	if (repfdw_plan_scan_is_indexed(sql))
-		return REPFDW_MODE_SERVE_LOCAL;
+	if (!repfdw_plan_scan_is_indexed(sql))
+		return REPFDW_MODE_CTID_SLICE;
 
-	return REPFDW_MODE_CTID_SLICE;
+	/* Index-served: split a large IN-list, else serve the whole query locally. */
+	saoe = RepFdwGetSplittableIn(fpinfo->remote_conds);
+	nreplicas = list_length(fpinfo->opts->replicas);
+	if (saoe != NULL && nreplicas > 1 &&
+		RepFdwInValueCount(saoe) >= REPFDW_VALUE_SPLIT_MIN)
+		return REPFDW_MODE_VALUE_SPLIT;
+
+	return REPFDW_MODE_SERVE_LOCAL;
 }
 
 /*
@@ -344,7 +366,8 @@ repfdwGetForeignPaths(PlannerInfo *root, RelOptInfo *baserel,
 {
 	RepFdwPlanState *fpinfo = (RepFdwPlanState *) baserel->fdw_private;
 	int			nreplicas = Max(1, list_length(fpinfo->opts->replicas));
-	double		per_child_rows = clamp_row_est(baserel->rows / nreplicas);
+	int			nchildren;
+	double		per_child_rows;
 	List	   *subpaths = NIL;
 	AppendPathInput input;
 	int			i;
@@ -373,11 +396,23 @@ repfdwGetForeignPaths(PlannerInfo *root, RelOptInfo *baserel,
 		return;
 	}
 
-	for (i = 0; i < nreplicas; i++)
+	/*
+	 * Value-split fans out to P = min(nreplicas, #distinct IN values) children
+	 * (each replica scans its value chunk); ctid-slice uses one child per
+	 * replica.
+	 */
+	if (fpinfo->mode == REPFDW_MODE_VALUE_SPLIT)
+		nchildren = Min(nreplicas,
+						RepFdwInValueCount(RepFdwGetSplittableIn(fpinfo->remote_conds)));
+	else
+		nchildren = nreplicas;
+	per_child_rows = clamp_row_est(baserel->rows / nchildren);
+
+	for (i = 0; i < nchildren; i++)
 	{
 		Cost		startup_cost = 0;
 		Cost		total_cost = startup_cost
-			+ (seq_page_cost * baserel->pages) / nreplicas
+			+ (seq_page_cost * baserel->pages) / nchildren
 			+ cpu_tuple_cost * per_child_rows;
 		ForeignPath *child;
 
@@ -643,6 +678,22 @@ repfdwGetForeignPlan(PlannerInfo *root, RelOptInfo *baserel,
 		scan_clauses = extract_actual_clauses(local_exprs, false);
 	}
 
+	/*
+	 * Value-split: replace this child's predicate with its own contiguous,
+	 * key-sorted chunk of the IN-list -- "col = ANY (ARRAY[subset])" and no ctid
+	 * bound.  The child index rides in best_path->fdw_private; the chunk count P
+	 * matches the number of children built in repfdwGetForeignPaths.
+	 */
+	if (fpinfo->mode == REPFDW_MODE_VALUE_SPLIT)
+	{
+		ScalarArrayOpExpr *saoe = RepFdwGetSplittableIn(fpinfo->remote_conds);
+		int			P = Min(list_length(fpinfo->opts->replicas),
+							RepFdwInValueCount(saoe));
+		int			idx = intVal(linitial(best_path->fdw_private));
+
+		remote_pred = RepFdwDeparseInChunk(foreigntableid, saoe, idx, P);
+	}
+
 	if (bms_is_member(0 - FirstLowInvalidHeapAttributeNumber,
 					  fpinfo->attrs_used))
 	{
@@ -692,8 +743,19 @@ repfdwGetForeignPlan(PlannerInfo *root, RelOptInfo *baserel,
 							 makeInteger((int) foreigntableid));
 	fdw_private = lappend(fdw_private,
 						  makeInteger(intVal(linitial(best_path->fdw_private))));
-	fdw_private = lappend(fdw_private,
-						  makeInteger(list_length(fpinfo->opts->replicas)));
+	/*
+	 * The "nreplicas" slot is really this scan's participating child count: for
+	 * value-split that is P (min of replicas and distinct values), matching the
+	 * children built in repfdwGetForeignPaths; for ctid-slice it is every
+	 * replica (slices idle past P are decided at exec).
+	 */
+	if (fpinfo->mode == REPFDW_MODE_VALUE_SPLIT)
+		fdw_private = lappend(fdw_private,
+							  makeInteger(Min(list_length(fpinfo->opts->replicas),
+											  RepFdwInValueCount(RepFdwGetSplittableIn(fpinfo->remote_conds)))));
+	else
+		fdw_private = lappend(fdw_private,
+							  makeInteger(list_length(fpinfo->opts->replicas)));
 	fdw_private = lappend(fdw_private, makeInteger(fpinfo->mode));
 
 	return make_foreignscan(tlist,
@@ -724,6 +786,24 @@ repfdw_run_slice_query(RepFdwScanState *fsstate)
 	BlockNumber nblocks;
 	int			P;
 	char	   *sql;
+
+	/*
+	 * Value-split: this child runs its own IN-list chunk (already deparsed into
+	 * remote_pred) with no ctid bound -- the value chunks, not block ranges,
+	 * are the disjoint partition here.  Every value-split child participates
+	 * (my_index < P by construction).
+	 */
+	if (fsstate->mode == REPFDW_MODE_VALUE_SPLIT)
+	{
+		RepFdwCtidBound nobound = {NULL, NULL};
+
+		sql = RepFdwBuildBoundedSql(fsstate->sql_template, fsstate->remote_pred,
+									&nobound);
+		RepFdwStartOneQuery(rconn, sql, &nobound, fsstate->fetch_size);
+		fsstate->my_active = true;
+		fsstate->my_started = true;
+		return;
+	}
 
 	nblocks = RepFdwGetNBlocks(fsstate->opts->schema_name,
 							   fsstate->opts->table_name);

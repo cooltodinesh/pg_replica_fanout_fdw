@@ -224,4 +224,16 @@ extern bool RepFdwIsForeignQual(PlannerInfo *root, RelOptInfo *baserel,
 								 Expr *expr);
 extern char *RepFdwDeparseQuals(Oid foreigntableid, List *remote_exprs);
 
+/*
+ * Value-split (IN-list) helpers.  RepFdwGetSplittableIn returns the single
+ * shippable "col = ANY (ARRAY[literals])" clause when remote_conds is exactly
+ * that, else NULL.  RepFdwInValueCount is its distinct-value count.
+ * RepFdwDeparseInChunk deparses the predicate for one contiguous, key-sorted,
+ * de-duplicated chunk (part of nparts) of that value list.
+ */
+extern ScalarArrayOpExpr *RepFdwGetSplittableIn(List *remote_conds);
+extern int	RepFdwInValueCount(ScalarArrayOpExpr *saoe);
+extern char *RepFdwDeparseInChunk(Oid foreigntableid, ScalarArrayOpExpr *saoe,
+								  int part, int nparts);
+
 #endif							/* PG_REPLICA_FANOUT_FDW_H */

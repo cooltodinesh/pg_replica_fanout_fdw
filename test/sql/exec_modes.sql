@@ -61,3 +61,29 @@ SELECT count(*)
 -- local table directly.)
 SELECT (SELECT id FROM mode_ft WHERE id = 42)
      = (SELECT id FROM mode_t  WHERE id = 42) AS serve_local_matches_local;
+
+-- 7. A large IN-list on the indexed column is index-served AND has many distinct
+-- values, so the value list is split across the replicas: an Append of P
+-- children, each an Async Foreign Scan whose Remote SQL carries a disjoint,
+-- key-sorted chunk of the values and NO ctid bound.
+EXPLAIN (COSTS OFF)
+  SELECT id FROM mode_ft WHERE id IN (5,10,15,20,25,30,35,40,45,50,55,60);
+-- exactly those rows, once each
+SELECT id FROM mode_ft WHERE id IN (5,10,15,20,25,30,35,40,45,50,55,60)
+  ORDER BY id;
+-- the split's union count equals the un-split local count
+SELECT (SELECT count(*) FROM mode_ft
+          WHERE id IN (5,10,15,20,25,30,35,40,45,50,55,60))
+     = (SELECT count(*) FROM mode_t
+          WHERE id IN (5,10,15,20,25,30,35,40,45,50,55,60)) AS in_split_count_matches;
+
+-- 8. A small IN-list (below the split threshold) on the indexed column is served
+-- locally, not split.
+EXPLAIN (COSTS OFF) SELECT id FROM mode_ft WHERE id IN (5, 10, 15);
+SELECT id FROM mode_ft WHERE id IN (5, 10, 15) ORDER BY id;
+
+-- 9. Duplicate values in a splittable IN-list must not yield duplicate rows:
+-- the values are de-duplicated before splitting, so each distinct value lands
+-- in exactly one chunk.  Ten distinct values (>= threshold), two duplicated.
+SELECT id FROM mode_ft
+  WHERE id IN (5,5,10,10,15,20,25,30,35,40,45,50) ORDER BY id;

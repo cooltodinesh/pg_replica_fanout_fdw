@@ -24,10 +24,13 @@
 #include "commands/defrem.h"
 #include "foreign/foreign.h"
 #include "lib/stringinfo.h"
+#include "nodes/makefuncs.h"
 #include "optimizer/optimizer.h"
+#include "utils/array.h"
 #include "utils/builtins.h"
 #include "utils/lsyscache.h"
 #include "utils/syscache.h"
+#include "utils/typcache.h"
 
 #include "pg_replica_fanout_fdw.h"
 
@@ -570,4 +573,180 @@ RepFdwDeparseQuals(Oid foreigntableid, List *remote_exprs)
 	}
 
 	return buf.data;
+}
+
+/*
+ * RepFdwGetSplittableIn
+ *		If remote_conds is exactly one shippable "col = ANY (ARRAY[literals])"
+ *		clause -- i.e. a plain IN-list on a column against a literal array --
+ *		return that ScalarArrayOpExpr; otherwise NULL.  This is the clause the
+ *		value-split mode partitions across replicas.
+ */
+ScalarArrayOpExpr *
+RepFdwGetSplittableIn(List *remote_conds)
+{
+	RestrictInfo *ri;
+	ScalarArrayOpExpr *saoe;
+	Node	   *arr;
+
+	if (list_length(remote_conds) != 1)
+		return NULL;
+	ri = (RestrictInfo *) linitial(remote_conds);
+	if (!IsA(ri->clause, ScalarArrayOpExpr))
+		return NULL;
+	saoe = (ScalarArrayOpExpr *) ri->clause;
+	if (!saoe->useOr || list_length(saoe->args) != 2)
+		return NULL;			/* ANY (IN), not ALL, with a scalar/array pair */
+	if (!IsA(linitial(saoe->args), Var))
+		return NULL;			/* a plain column on the left */
+	arr = (Node *) lsecond(saoe->args);
+	if (!IsA(arr, Const) || ((Const *) arr)->constisnull)
+		return NULL;			/* a literal, non-null array on the right */
+	return saoe;
+}
+
+/* qsort_arg comparator over Datums using a type's btree compare proc */
+typedef struct RepFdwDatumSortCtx
+{
+	FmgrInfo   *cmp;
+	Oid			collation;
+} RepFdwDatumSortCtx;
+
+static int
+repfdw_datum_cmp(const void *a, const void *b, void *arg)
+{
+	RepFdwDatumSortCtx *ctx = (RepFdwDatumSortCtx *) arg;
+	Datum		x = *(const Datum *) a;
+	Datum		y = *(const Datum *) b;
+
+	return DatumGetInt32(FunctionCall2Coll(ctx->cmp, ctx->collation, x, y));
+}
+
+/*
+ * repfdw_in_sorted_unique
+ *		Extract the IN clause's array elements as a palloc'd Datum array, with
+ *		NULLs dropped, sorted into the element type's btree key order, and
+ *		de-duplicated.  Sorting gives each replica a contiguous key range (so its
+ *		index scan reads a tight run of leaf pages); de-duplication guarantees a
+ *		value lands in exactly one chunk, so no row is emitted by two replicas.
+ *		If the type has no btree ordering, the values are left in list order
+ *		(still correct, just without the locality benefit).
+ */
+static void
+repfdw_in_sorted_unique(ScalarArrayOpExpr *saoe,
+						Datum **elems_out, int *nelems_out,
+						Oid *elemtype_out, int16 *elmlen_out,
+						bool *elmbyval_out, char *elmalign_out)
+{
+	Const	   *arrconst = (Const *) lsecond(saoe->args);
+	ArrayType  *arr = DatumGetArrayTypeP(arrconst->constvalue);
+	Oid			elemtype = ARR_ELEMTYPE(arr);
+	int16		elmlen;
+	bool		elmbyval;
+	char		elmalign;
+	Datum	   *elems;
+	bool	   *nulls;
+	int			nelems;
+	Datum	   *out;
+	int			nout = 0;
+	TypeCacheEntry *tce;
+	int			i;
+
+	get_typlenbyvalalign(elemtype, &elmlen, &elmbyval, &elmalign);
+	deconstruct_array(arr, elemtype, elmlen, elmbyval, elmalign,
+					  &elems, &nulls, &nelems);
+
+	out = (Datum *) palloc(sizeof(Datum) * Max(nelems, 1));
+	for (i = 0; i < nelems; i++)
+		if (!nulls[i])
+			out[nout++] = elems[i];
+
+	tce = lookup_type_cache(elemtype, TYPECACHE_CMP_PROC_FINFO);
+	if (nout > 1 && OidIsValid(tce->cmp_proc_finfo.fn_oid))
+	{
+		RepFdwDatumSortCtx ctx;
+		int			w = 0;
+
+		ctx.cmp = &tce->cmp_proc_finfo;
+		ctx.collation = saoe->inputcollid;
+		qsort_arg(out, nout, sizeof(Datum), repfdw_datum_cmp, &ctx);
+
+		/* drop duplicates (adjacent after sorting); compare to last kept */
+		for (i = 0; i < nout; i++)
+		{
+			if (w == 0 ||
+				DatumGetInt32(FunctionCall2Coll(ctx.cmp, ctx.collation,
+												out[w - 1], out[i])) != 0)
+				out[w++] = out[i];
+		}
+		nout = w;
+	}
+
+	*elems_out = out;
+	*nelems_out = nout;
+	*elemtype_out = elemtype;
+	*elmlen_out = elmlen;
+	*elmbyval_out = elmbyval;
+	*elmalign_out = elmalign;
+}
+
+/*
+ * RepFdwInValueCount
+ *		Number of distinct non-null values in the IN clause's array.
+ */
+int
+RepFdwInValueCount(ScalarArrayOpExpr *saoe)
+{
+	Datum	   *elems;
+	int			nelems;
+	Oid			elemtype;
+	int16		elmlen;
+	bool		elmbyval;
+	char		elmalign;
+
+	repfdw_in_sorted_unique(saoe, &elems, &nelems, &elemtype,
+							&elmlen, &elmbyval, &elmalign);
+	return nelems;
+}
+
+/*
+ * RepFdwDeparseInChunk
+ *		Deparse "col = ANY (ARRAY[chunk])" for one contiguous chunk (part of
+ *		nparts) of the sorted, de-duplicated value list.  The chunks partition
+ *		the whole list, so their union reproduces the original IN exactly.
+ */
+char *
+RepFdwDeparseInChunk(Oid foreigntableid, ScalarArrayOpExpr *saoe,
+					 int part, int nparts)
+{
+	Const	   *arrconst = (Const *) lsecond(saoe->args);
+	Datum	   *elems;
+	int			nelems;
+	Oid			elemtype;
+	int16		elmlen;
+	bool		elmbyval;
+	char		elmalign;
+	int			lo,
+				hi;
+	ArrayType  *subarr;
+	Const	   *subconst;
+	ScalarArrayOpExpr *sub;
+
+	repfdw_in_sorted_unique(saoe, &elems, &nelems, &elemtype,
+							&elmlen, &elmbyval, &elmalign);
+
+	lo = (int) ((int64) nelems * part / nparts);
+	hi = (int) ((int64) nelems * (part + 1) / nparts);
+
+	subarr = construct_array(&elems[lo], hi - lo, elemtype,
+							 elmlen, elmbyval, elmalign);
+	subconst = makeConst(arrconst->consttype, -1, arrconst->constcollid,
+						 -1, PointerGetDatum(subarr), false, false);
+
+	/* copy the SAOE and swap in the chunk array; keeps op/collation/version
+	 * fields intact */
+	sub = copyObject(saoe);
+	sub->args = list_make2(copyObject(linitial(saoe->args)), subconst);
+
+	return RepFdwDeparseQuals(foreigntableid, list_make1(sub));
 }
