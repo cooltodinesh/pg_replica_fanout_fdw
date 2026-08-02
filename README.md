@@ -8,7 +8,10 @@ It supports a raw fan-out scan, pushdown of shippable `WHERE` quals (see
 "Qual pushdown" below), and pushdown of `count(*)` including a shippable
 `WHERE` (see "Aggregate pushdown" below); everything else (`ORDER BY`,
 `LIMIT`, and every other aggregate) is still evaluated locally on the
-coordinator.
+coordinator. Not every scan fans out: a query an index can serve is answered
+directly from the coordinator's local copy, and a large `IN`-list is split
+across replicas by value instead of by block — the mode is chosen per query
+from what the local planner would do (see "Execution plan selection").
 
 Requires **PostgreSQL 19+** (uses `PQsetChunkedRowsMode`/
 `PGRES_TUPLES_CHUNK`, the `libpqsrv_*` connection helpers, and the
@@ -31,17 +34,19 @@ SELECT * FROM big_ft;   -- each replica scans a disjoint ctid block range
 ```
 
 Each replica must hold a byte-identical copy of the table (a physical
-streaming standby of the same primary). The coordinator itself never reads
-the table's local heap blocks — it only dispatches per-slice queries over
-libpq and round-robin-merges the results. To have the coordinator/primary
-contribute I/O too, just list it in `replicas` like any other node.
+streaming standby of the same primary), and the **coordinator is itself one
+instance of that cluster** with the table present locally. It uses that local
+copy two ways: to size the ctid slices (one authoritative block count), and —
+for a query an index can serve — to answer the scan directly without any
+fan-out (see "Execution plan selection"). For a big fan-out scan it dispatches
+per-slice queries over libpq and merges the results. To have the coordinator
+contribute fan-out I/O too, just list it in `replicas` like any other node.
 
 ## Options
 
 | Option | Object | Default | Notes |
 |---|---|---|---|
 | `replicas` | SERVER | *(required)* | `'host1[:port],host2,...'`; order = replica/slice index |
-| `dbname` | SERVER | coordinator's current database | standbys share the primary's catalogs |
 | `consistency` | SERVER | `'none'` | only `'none'` is currently supported |
 | `fetch_size` | SERVER/table | 1000 | rows per streamed chunk |
 | `connect_timeout` | SERVER | 5 (seconds) | |
@@ -81,6 +86,51 @@ contribute I/O too, just list it in `replicas` like any other node.
   `sum`/`avg`/`min`/`max`, `HAVING`) falls back to fetching every row and
   aggregating locally.
 
+## Execution plan selection
+
+A scan of a foreign table runs in one of three **modes**, chosen once during
+planning from the query's shape and from what the *local* planner would do with
+the co-located copy. The coordinator plans (but does not execute) an equivalent
+scan of the local table and inspects the access path it picks — the local
+instance has the same indexes and full column statistics as the replicas, so its
+choice is the faithful signal for "would fanning this out actually help?" A
+foreign table's own costing can never surface this, because the planner never
+builds an index path on a foreign table.
+
+| Local plan for the query | Mode | What runs |
+|---|---|---|
+| No shippable `WHERE`, or a **sequential / TID-range scan** | **ctid-slice fan-out** (default) | each replica scans a disjoint heap **block range** (its ctid slice) and streams rows back; the coordinator merges them |
+| **Index / bitmap / index-only scan** on a shippable `WHERE` | **serve-local** | the whole query is answered from the **coordinator's own local copy** via one index scan — no fan-out, no replica connection, nothing over the network |
+| Index-served, and the whole shippable qual is one large **`IN (...)`** | **value-split fan-out** | the value list is sorted, de-duplicated and dealt in contiguous chunks across `P = min(replicas, distinct values)` replicas; each runs a real index scan over `col = ANY(its chunk)`, with no ctid bound |
+
+Why each:
+
+- **Big block scans** are where fan-out pays: there is a lot of I/O to divide,
+  and each replica reads only ~1/N of the heap. This is the extension's original
+  purpose.
+- **A selective index lookup is already fast on one node**, so fanning it out N
+  ways would only duplicate the index descent on every replica. Serving it from
+  the coordinator's own copy avoids the network entirely.
+- **A large `IN`-list** on an indexed column is the case where fan-out *does*
+  help an index scan: splitting the values parallelizes index probing that a
+  single node does serially, while sorted contiguous chunks keep each replica's
+  scan local to a tight run of index leaf pages. De-duplication is required for
+  correctness — a value in two chunks would be returned by two replicas.
+
+`EXPLAIN` names the non-default modes: serve-local shows `Fanout Mode:
+serve-local` and a `Local SQL` line (and no per-replica children); value-split
+shows `Fanout Mode: value-split fan-out` with each child's own `col = ANY(chunk)`
+template. The default ctid-slice fan-out prints no mode line (an `Append` of
+per-replica `Async Foreign Scan`s).
+
+The three modes partition along different dimensions but stay sound the same
+way: the ctid bound is emitted **only** in ctid-slice mode — the keyed modes
+(serve-local, value-split) never carry one, since a value/key partition plus a
+block-range bound would drop rows. Not yet mode-aware: `count(*)` pushdown always
+uses the fan-out combine node regardless of an index, and range / `ORDER BY` /
+`GROUP BY`-by-key splitting (which would need a value histogram) isn't
+implemented.
+
 ## Known limitations
 
 - **Read-only.** No INSERT/UPDATE/DELETE, no join pushdown.
@@ -92,16 +142,17 @@ contribute I/O too, just list it in `replicas` like any other node.
   under its own `REPEATABLE READ` snapshot with no cross-replica skew
   bound. Any connect or scan failure is a plain `ERROR` — there is no
   degraded/redistribute mode.
-- **Slice bounds are sized from replica 0 only.** `nblocks` (and hence
-  every slice's ctid range) is discovered by asking replica 0 for
-  `pg_relation_size()`, once, at the start of the scan. If a *different*
-  replica is lagging and hasn't replayed out to that block count yet, the
-  middle slices it's assigned (bounded on both sides) can silently return
-  fewer rows than expected for blocks it hasn't caught up to. The
-  open-ended first and last slices (`ctid < hi` / `ctid >= lo`, no other
-  bound) aren't affected the same way since they cover whatever the
-  replica actually has. There's no cross-replica alignment to fix this in
-  `consistency='none'` — that needs LSN-based coordination.
+- **Slice bounds are sized from the coordinator's local copy.** `nblocks`
+  (and hence every slice's ctid range) is read once from the co-located local
+  table (`RelationGetNumberOfBlocks`), so every slice shares one authoritative
+  divisor and the boundaries line up exactly. If a *different* replica is
+  lagging and hasn't replayed out to that block count yet, the middle slices
+  it's assigned (bounded on both sides) can silently return fewer rows than
+  expected for blocks it hasn't caught up to. The open-ended first and last
+  slices (`ctid < hi` / `ctid >= lo`, no other bound) aren't affected the same
+  way since they cover whatever the replica actually has. There's no
+  cross-replica alignment to fix this in `consistency='none'` — that needs
+  LSN-based coordination.
 - **One live scan per replica connection.** Each cached connection
   streams a single chunked query at a time (`PQsendQuery` +
   `PQsetChunkedRowsMode`), so it can't serve two concurrently-active
@@ -144,7 +195,7 @@ underlying I/O path.
 
 ## Testing
 
-`make installcheck` runs seven suites against a **loopback harness**: all
+`make installcheck` runs eight suites against a **loopback harness**: all
 "replicas" point at the same local instance (`replicas
 'localhost:5432,localhost:5432,localhost:5432'`). Disjoint ctid slices
 still union to exactly the whole table, so slicing/fan-out/merge/rescan
@@ -165,7 +216,7 @@ demonstrate a real I/O speedup (see above).
   the replica, and respects `connect_timeout` instead of hanging.
 - `invalidation` — `ALTER SERVER`/`ALTER USER MAPPING` are picked up by
   the next query in the same session.
-- `count_pushdown` — `count(*)` (with or without a shippable `WHERE`) is
+- `aggregation` — `count(*)` (with or without a shippable `WHERE`) is
   pushed down (no `Agg` node, correct sum of per-replica partials); every
   other aggregate shape (`count(DISTINCT ...)`, a non-shippable `WHERE`
   conjunct, `GROUP BY`, `sum`, `HAVING`) falls back to a correct local
@@ -176,6 +227,13 @@ demonstrate a real I/O speedup (see above).
   `now()`) and `VOLATILE` (e.g. `random()`) conjuncts are rejected and
   stay a local `Filter`, including in a mixed AND with a shippable
   conjunct.
+- `exec_modes` — the execution mode is chosen from the local plan: a
+  selective indexed qual is served locally (single `Foreign Scan`,
+  `Fanout Mode: serve-local`, no fan-out) with the right rows and a stable
+  set under rescan; a full scan and a non-selective unindexed qual fan out
+  by ctid slice; a large indexed `IN`-list splits into disjoint key-sorted
+  per-replica chunks (correct, complete, duplicate-free), while a small
+  `IN` stays local.
 
 ```
 make PG_CONFIG=/path/to/pg_config
@@ -194,9 +252,8 @@ src/
   pg_replica_fanout_fdw.c                handler + FDW plan/exec callbacks
   option.c                        validator, option parsing, replicas-list parser
   connection.c                    conn cache, concurrent connect, streaming loop, xact callbacks
-  deparse.c                       SELECT template, qual shippability/deparse, ctid placeholder
-  slice.c                         nblocks discovery + block-range math
-  merge.c                         round-robin merge + tuple materialization
+  deparse.c                       SELECT template, qual shippability/deparse, ctid placeholder, IN-list chunking
+  slice.c                         local nblocks + block-range (ctid slice) math
 test/
   loopback-setup.sql              shared \i'd setup for the loopback suites
   sql/, expected/                 pg_regress suites (see Testing above)
