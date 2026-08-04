@@ -218,24 +218,12 @@ repfdw_foreign_expr_walker(Node *node, PlannerInfo *root, RelOptInfo *baserel)
 			return true;
 
 		case T_OpExpr:
-			{
-				OpExpr	   *oe = (OpExpr *) node;
-
-				if (list_length(oe->args) != 1 && list_length(oe->args) != 2)
-					return false;
-				return repfdw_foreign_expr_walker((Node *) oe->args, root,
-												  baserel);
-			}
+			return repfdw_foreign_expr_walker((Node *) ((OpExpr *) node)->args,
+											  root, baserel);
 
 		case T_ScalarArrayOpExpr:
-			{
-				ScalarArrayOpExpr *sae = (ScalarArrayOpExpr *) node;
-
-				if (list_length(sae->args) != 2)
-					return false;
-				return repfdw_foreign_expr_walker((Node *) sae->args, root,
-												  baserel);
-			}
+			return repfdw_foreign_expr_walker((Node *) ((ScalarArrayOpExpr *) node)->args,
+											  root, baserel);
 
 		case T_BoolExpr:
 			return repfdw_foreign_expr_walker((Node *) ((BoolExpr *) node)->args,

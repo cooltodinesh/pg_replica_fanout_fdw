@@ -140,6 +140,7 @@ pg_replica_fanout_fdw_handler(PG_FUNCTION_ARGS)
  *		index-only scan may show as a regular index scan or, if the qual isn't
  *		selective enough, as a seq scan), which at worst mislabels a serve-local
  *		candidate as fan-out -- never the reverse, and never a wrong answer.
+ *		todo: address this comment later.
  */
 static bool
 repfdw_plan_scan_is_indexed(const char *sql)
@@ -150,25 +151,25 @@ repfdw_plan_scan_is_indexed(const char *sql)
 	Query	   *query;
 	PlannedStmt *plan;
 	Plan	   *scan;
-	bool		pushed_snapshot = false;
 	bool		result = false;
 
+	elog(DEBUG1, "pg_replica_fanout_fdw: probing indexability with sql: %s", sql);
+
 	parsetree_list = pg_parse_query(sql);
+	/* We built sql as one SELECT; anything else means don't trust the probe. */
 	if (list_length(parsetree_list) != 1)
 		return false;
+
 	raw = linitial_node(RawStmt, parsetree_list);
 	querytree_list = pg_analyze_and_rewrite_fixedparams(raw, sql, NULL, 0, NULL);
+	/* Rule expansion turned one query into several -- again, not what we sent. */
 	if (list_length(querytree_list) != 1)
 		return false;
+
 	query = linitial_node(Query, querytree_list);
+	/* Guard the CMD_SELECT assumption behind pg_plan_query below. */
 	if (query->commandType != CMD_SELECT)
 		return false;
-
-	if (!ActiveSnapshotSet())
-	{
-		PushActiveSnapshot(GetTransactionSnapshot());
-		pushed_snapshot = true;
-	}
 
 	plan = pg_plan_query(query, sql, 0 /* cursorOptions */ , NULL, NULL);
 
@@ -186,9 +187,6 @@ repfdw_plan_scan_is_indexed(const char *sql)
 			break;
 		scan = scan->lefttree;
 	}
-
-	if (pushed_snapshot)
-		PopActiveSnapshot();
 
 	return result;
 }
@@ -229,6 +227,7 @@ repfdw_choose_mode(RepFdwPlanState *fpinfo, bool local_ok)
 	ScalarArrayOpExpr *saoe;
 	int			nreplicas;
 
+	/* Nothing to push down, or no local copy to probe against -- skip straight to fan-out. */
 	if (fpinfo->remote_conds == NIL || !local_ok)
 		return REPFDW_MODE_CTID_SLICE;
 
@@ -236,8 +235,6 @@ repfdw_choose_mode(RepFdwPlanState *fpinfo, bool local_ok)
 		remote_exprs = lappend(remote_exprs,
 							   ((RestrictInfo *) lfirst(lc))->clause);
 	pred = RepFdwDeparseQuals(fpinfo->foreigntableid, remote_exprs);
-	if (pred == NULL)
-		return REPFDW_MODE_CTID_SLICE;
 
 	sql = psprintf("SELECT * FROM %s WHERE %s",
 				   quote_qualified_identifier(fpinfo->opts->schema_name,
@@ -276,7 +273,6 @@ repfdwGetForeignRelSize(PlannerInfo *root, RelOptInfo *baserel,
 	RepFdwGetOptions(foreigntableid, &fpinfo->opts);
 	fpinfo->foreigntableid = foreigntableid;
 
-	fpinfo->attrs_used = NULL;
 	pull_varattnos((Node *) baserel->reltarget->exprs, baserel->relid,
 				   &fpinfo->attrs_used);
 
@@ -495,8 +491,6 @@ repfdwGetForeignUpperPaths(PlannerInfo *root, UpperRelationKind stage,
 		bms_membership(input_rel->relids) != BMS_SINGLETON)
 		return;
 
-	ifpinfo = (RepFdwPlanState *) input_rel->fdw_private;
-
 	/* 4. No GROUP BY / grouping sets. */
 	if (root->parse->groupClause != NIL || root->parse->groupingSets != NIL)
 		return;
@@ -513,6 +507,7 @@ repfdwGetForeignUpperPaths(PlannerInfo *root, UpperRelationKind stage,
 	 * gets deparsed into the per-slice count(*) below, same as a plain
 	 * scan's remote predicate.
 	 */
+	ifpinfo = (RepFdwPlanState *) input_rel->fdw_private;
 	if (ifpinfo->local_conds != NIL)
 		return;
 
@@ -1053,11 +1048,19 @@ repfdw_store_next_row(RepFdwScanState *fsstate, TupleTableSlot *slot)
 
 /*
  * repfdwBeginForeignScan
- *		One Append child = one replica.  Connect the cached replica set, open
- *		the shared remote read-only transaction (idempotent across siblings),
- *		and run this node's slice query synchronously.  Async streaming and
- *		per-node connection ownership are later milestones; for now sibling
- *		children share the cached ReplicaSet, each driving conns[my_index].
+ *		Set up one scan node.  The node's mode (see RepFdwFanoutMode) decides
+ *		what happens:
+ *		  - SERVE_LOCAL: answer from the co-located local table via SPI; no
+ *			replica set and no remote transaction.
+ *		  - the aggregate combine node (is_agg): fan the partial query to every
+ *			replica at once.
+ *		  - otherwise a per-replica Append child (CTID_SLICE or VALUE_SPLIT):
+ *			connect the cached replica set, open the shared remote read-only
+ *			transaction (idempotent across siblings), check out this node's own
+ *			connection (conns[my_index]) so a colliding concurrent scan gets a
+ *			clean error, and start its query.  The query streams in chunked-rows
+ *			mode, driven asynchronously by the ForeignAsync* callbacks when the
+ *			Append is async-capable, or synchronously via IterateForeignScan.
  */
 static void
 repfdwBeginForeignScan(ForeignScanState *node, int eflags)
@@ -1076,11 +1079,13 @@ repfdwBeginForeignScan(ForeignScanState *node, int eflags)
 		return;
 
 	/*
-	 * fdw_private 7-tuple:
+	 * fdw_private 8-tuple:
 	 *   {sql_template, retrieved_attrs, remote_pred, is_count_agg,
-	 *    foreigntableid, my_index, nreplicas}
+	 *    foreigntableid, my_index, nreplicas, mode}
 	 * is_count_agg=true is the aggregate combine node (scanrelid==0, fans to
-	 * all replicas); false is a per-replica Append child (owns my_index).
+	 * all replicas); false is a per-replica Append child (owns my_index).  mode
+	 * is a RepFdwFanoutMode (see the header for how remote_pred is read per
+	 * mode).
 	 */
 	remote_pred = strVal(lthird(fdw_private));
 	if (remote_pred[0] == '\0')

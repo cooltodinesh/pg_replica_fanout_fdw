@@ -8,7 +8,7 @@ EXTENSION = pg_replica_fanout_fdw
 DATA = sql/pg_replica_fanout_fdw--0.1.0.sql
 
 REGRESS = basic slicing types_nulls errors invalidation aggregation qual_pushdown \
-          exec_modes
+          exec_modes schema_qual
 REGRESS_OPTS = --inputdir=test --outputdir=test
 
 PG_CONFIG = pg_config
