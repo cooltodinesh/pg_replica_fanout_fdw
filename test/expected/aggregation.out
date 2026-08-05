@@ -51,12 +51,14 @@ SELECT count(*), sum(id), min(id), max(id), avg(id)::numeric(10,4) FROM aft;
 -- 2. Bare count(*) is PUSHED DOWN: a Foreign Scan whose remote SQL is
 -- "SELECT count(*)", with no Aggregate node above it.
 EXPLAIN (COSTS OFF) SELECT count(*) FROM aft;
-                        QUERY PLAN                        
-----------------------------------------------------------
+                                                 QUERY PLAN                                                  
+-------------------------------------------------------------------------------------------------------------
  Foreign Scan
-   Replicas: 3
-   Remote SQL Template: SELECT count(*) FROM public.agg_t
-(3 rows)
+   Fanout Mode: ctid-slice fan-out
+   Remote SQL (replica 0 @ localhost:5432): SELECT count(*) FROM public.agg_t WHERE ctid < $1
+   Remote SQL (replica 1 @ localhost:5432): SELECT count(*) FROM public.agg_t WHERE ctid >= $1 AND ctid < $2
+   Remote SQL (replica 2 @ localhost:5432): SELECT count(*) FROM public.agg_t WHERE ctid >= $1
+(5 rows)
 
 SELECT count(*) FROM aft;
  count 
@@ -69,42 +71,42 @@ SELECT count(*) FROM aft;
 -- to the full row count, proving the 3 slices are disjoint and complete.
 -- (BUFFERS OFF: PG18+ ANALYZE buffers accounting is noisy.)
 EXPLAIN (COSTS OFF) SELECT sum(id) FROM aft;
-                           QUERY PLAN                           
-----------------------------------------------------------------
+                                      QUERY PLAN                                      
+--------------------------------------------------------------------------------------
  Aggregate
    ->  Append
          ->  Async Foreign Scan on aft
-               Replica: 0
-               Replicas: 3
-               Remote SQL Template: SELECT id FROM public.agg_t
+               Fanout Mode: ctid-slice fan-out
+               Replica: 0 (localhost:5432)
+               Remote SQL: SELECT id FROM public.agg_t WHERE ctid < $1
          ->  Async Foreign Scan on aft
-               Replica: 1
-               Replicas: 3
-               Remote SQL Template: SELECT id FROM public.agg_t
+               Fanout Mode: ctid-slice fan-out
+               Replica: 1 (localhost:5432)
+               Remote SQL: SELECT id FROM public.agg_t WHERE ctid >= $1 AND ctid < $2
          ->  Async Foreign Scan on aft
-               Replica: 2
-               Replicas: 3
-               Remote SQL Template: SELECT id FROM public.agg_t
+               Fanout Mode: ctid-slice fan-out
+               Replica: 2 (localhost:5432)
+               Remote SQL: SELECT id FROM public.agg_t WHERE ctid >= $1
 (14 rows)
 
 EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF)
   SELECT sum(id) FROM aft;
-                             QUERY PLAN                             
---------------------------------------------------------------------
+                                      QUERY PLAN                                      
+--------------------------------------------------------------------------------------
  Aggregate (actual rows=1.00 loops=1)
    ->  Append (actual rows=400.00 loops=1)
          ->  Async Foreign Scan on aft (actual rows=128.00 loops=1)
-               Replica: 0
-               Replicas: 3
-               Remote SQL Template: SELECT id FROM public.agg_t
+               Fanout Mode: ctid-slice fan-out
+               Replica: 0 (localhost:5432)
+               Remote SQL: SELECT id FROM public.agg_t WHERE ctid < $1
          ->  Async Foreign Scan on aft (actual rows=136.00 loops=1)
-               Replica: 1
-               Replicas: 3
-               Remote SQL Template: SELECT id FROM public.agg_t
+               Fanout Mode: ctid-slice fan-out
+               Replica: 1 (localhost:5432)
+               Remote SQL: SELECT id FROM public.agg_t WHERE ctid >= $1 AND ctid < $2
          ->  Async Foreign Scan on aft (actual rows=136.00 loops=1)
-               Replica: 2
-               Replicas: 3
-               Remote SQL Template: SELECT id FROM public.agg_t
+               Fanout Mode: ctid-slice fan-out
+               Replica: 2 (localhost:5432)
+               Remote SQL: SELECT id FROM public.agg_t WHERE ctid >= $1
 (14 rows)
 
 SELECT sum(id) FROM aft;
@@ -126,12 +128,14 @@ SELECT grp, count(*), sum(id) FROM aft GROUP BY grp ORDER BY grp;
 -- 5. count(*) with a shippable WHERE: still pushed down, with the qual folded
 -- into each replica's remote count(*).
 EXPLAIN (COSTS OFF) SELECT count(*) FROM aft WHERE id > 100;
-                                      QUERY PLAN                                      
---------------------------------------------------------------------------------------
+                                                               QUERY PLAN                                                                
+-----------------------------------------------------------------------------------------------------------------------------------------
  Foreign Scan
-   Replicas: 3
-   Remote SQL Template: SELECT count(*) FROM public.agg_t WHERE (id > '100'::integer)
-(3 rows)
+   Fanout Mode: ctid-slice fan-out
+   Remote SQL (replica 0 @ localhost:5432): SELECT count(*) FROM public.agg_t WHERE ((id > '100'::integer)) AND ctid < $1
+   Remote SQL (replica 1 @ localhost:5432): SELECT count(*) FROM public.agg_t WHERE ((id > '100'::integer)) AND ctid >= $1 AND ctid < $2
+   Remote SQL (replica 2 @ localhost:5432): SELECT count(*) FROM public.agg_t WHERE ((id > '100'::integer)) AND ctid >= $1
+(5 rows)
 
 SELECT count(*), min(id), max(id) FROM aft WHERE id > 100;
  count | min | max 

@@ -79,24 +79,24 @@ SELECT id, val FROM mode_ft WHERE id BETWEEN 10 AND 13 ORDER BY id;
 -- 3. A full scan (no shippable qual) has nothing for an index to serve, so it
 -- fans out: an Append of per-replica Async Foreign Scans, no mode line.
 EXPLAIN (COSTS OFF) SELECT id FROM mode_ft ORDER BY id LIMIT 3;
-                              QUERY PLAN                               
------------------------------------------------------------------------
+                                         QUERY PLAN                                          
+---------------------------------------------------------------------------------------------
  Limit
    ->  Sort
          Sort Key: id
          ->  Append
                ->  Async Foreign Scan on mode_ft
-                     Replica: 0
-                     Replicas: 3
-                     Remote SQL Template: SELECT id FROM public.mode_t
+                     Fanout Mode: ctid-slice fan-out
+                     Replica: 0 (localhost:5432)
+                     Remote SQL: SELECT id FROM public.mode_t WHERE ctid < $1
                ->  Async Foreign Scan on mode_ft
-                     Replica: 1
-                     Replicas: 3
-                     Remote SQL Template: SELECT id FROM public.mode_t
+                     Fanout Mode: ctid-slice fan-out
+                     Replica: 1 (localhost:5432)
+                     Remote SQL: SELECT id FROM public.mode_t WHERE ctid >= $1 AND ctid < $2
                ->  Async Foreign Scan on mode_ft
-                     Replica: 2
-                     Replicas: 3
-                     Remote SQL Template: SELECT id FROM public.mode_t
+                     Fanout Mode: ctid-slice fan-out
+                     Replica: 2 (localhost:5432)
+                     Remote SQL: SELECT id FROM public.mode_t WHERE ctid >= $1
 (16 rows)
 
 -- 4. A non-selective qual (val >= 0 matches every row, and val is unindexed):
@@ -104,21 +104,21 @@ EXPLAIN (COSTS OFF) SELECT id FROM mode_ft ORDER BY id LIMIT 3;
 -- correctly declines serve-local when an index wouldn't help.  (The qual is
 -- still pushed into each per-replica template.)
 EXPLAIN (COSTS OFF) SELECT id FROM mode_ft WHERE val >= 0;
-                                      QUERY PLAN                                       
----------------------------------------------------------------------------------------
+                                                 QUERY PLAN                                                  
+-------------------------------------------------------------------------------------------------------------
  Append
    ->  Async Foreign Scan on mode_ft
-         Replica: 0
-         Replicas: 3
-         Remote SQL Template: SELECT id FROM public.mode_t WHERE (val >= '0'::integer)
+         Fanout Mode: ctid-slice fan-out
+         Replica: 0 (localhost:5432)
+         Remote SQL: SELECT id FROM public.mode_t WHERE ((val >= '0'::integer)) AND ctid < $1
    ->  Async Foreign Scan on mode_ft
-         Replica: 1
-         Replicas: 3
-         Remote SQL Template: SELECT id FROM public.mode_t WHERE (val >= '0'::integer)
+         Fanout Mode: ctid-slice fan-out
+         Replica: 1 (localhost:5432)
+         Remote SQL: SELECT id FROM public.mode_t WHERE ((val >= '0'::integer)) AND ctid >= $1 AND ctid < $2
    ->  Async Foreign Scan on mode_ft
-         Replica: 2
-         Replicas: 3
-         Remote SQL Template: SELECT id FROM public.mode_t WHERE (val >= '0'::integer)
+         Fanout Mode: ctid-slice fan-out
+         Replica: 2 (localhost:5432)
+         Remote SQL: SELECT id FROM public.mode_t WHERE ((val >= '0'::integer)) AND ctid >= $1
 (13 rows)
 
 SELECT count(*) FROM mode_ft WHERE val >= 0;
@@ -156,25 +156,22 @@ SELECT (SELECT id FROM mode_ft WHERE id = 42)
 -- key-sorted chunk of the values and NO ctid bound.
 EXPLAIN (COSTS OFF)
   SELECT id FROM mode_ft WHERE id IN (5,10,15,20,25,30,35,40,45,50,55,60);
-                                               QUERY PLAN                                                
----------------------------------------------------------------------------------------------------------
+                                            QUERY PLAN                                            
+--------------------------------------------------------------------------------------------------
  Append
    ->  Async Foreign Scan on mode_ft
          Fanout Mode: value-split fan-out
-         Replica: 0
-         Replicas: 3
-         Remote SQL Template: SELECT id FROM public.mode_t WHERE (id = ANY ('{5,10,15,20}'::integer[]))
+         Replica: 0 (localhost:5432)
+         Remote SQL: SELECT id FROM public.mode_t WHERE ((id = ANY ('{5,10,15,20}'::integer[])))
    ->  Async Foreign Scan on mode_ft
          Fanout Mode: value-split fan-out
-         Replica: 1
-         Replicas: 3
-         Remote SQL Template: SELECT id FROM public.mode_t WHERE (id = ANY ('{25,30,35,40}'::integer[]))
+         Replica: 1 (localhost:5432)
+         Remote SQL: SELECT id FROM public.mode_t WHERE ((id = ANY ('{25,30,35,40}'::integer[])))
    ->  Async Foreign Scan on mode_ft
          Fanout Mode: value-split fan-out
-         Replica: 2
-         Replicas: 3
-         Remote SQL Template: SELECT id FROM public.mode_t WHERE (id = ANY ('{45,50,55,60}'::integer[]))
-(16 rows)
+         Replica: 2 (localhost:5432)
+         Remote SQL: SELECT id FROM public.mode_t WHERE ((id = ANY ('{45,50,55,60}'::integer[])))
+(13 rows)
 
 -- exactly those rows, once each
 SELECT id FROM mode_ft WHERE id IN (5,10,15,20,25,30,35,40,45,50,55,60)

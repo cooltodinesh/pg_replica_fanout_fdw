@@ -52,12 +52,12 @@ SELECT count(*) FROM inv_ft;
 (1 row)
 
 EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF) SELECT * FROM inv_ft;
-                       QUERY PLAN                        
----------------------------------------------------------
+                     QUERY PLAN                      
+-----------------------------------------------------
  Foreign Scan on inv_ft (actual rows=400.00 loops=1)
-   Replica: 0
-   Replicas: 1
-   Remote SQL Template: SELECT id, pad FROM public.inv_t
+   Fanout Mode: ctid-slice fan-out
+   Replica: 0 (localhost:5432)
+   Remote SQL: SELECT id, pad FROM public.inv_t
 (4 rows)
 
 -- Widen the replica list: the cached ReplicaSet must be rebuilt.  If it is,
@@ -70,21 +70,21 @@ SELECT count(*) FROM inv_ft;
 (1 row)
 
 EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF) SELECT * FROM inv_ft;
-                           QUERY PLAN                            
------------------------------------------------------------------
+                                     QUERY PLAN                                      
+-------------------------------------------------------------------------------------
  Append (actual rows=400.00 loops=1)
    ->  Async Foreign Scan on inv_ft (actual rows=128.00 loops=1)
-         Replica: 0
-         Replicas: 3
-         Remote SQL Template: SELECT id, pad FROM public.inv_t
+         Fanout Mode: ctid-slice fan-out
+         Replica: 0 (localhost:5432)
+         Remote SQL: SELECT id, pad FROM public.inv_t WHERE ctid < $1
    ->  Async Foreign Scan on inv_ft (actual rows=136.00 loops=1)
-         Replica: 1
-         Replicas: 3
-         Remote SQL Template: SELECT id, pad FROM public.inv_t
+         Fanout Mode: ctid-slice fan-out
+         Replica: 1 (localhost:5432)
+         Remote SQL: SELECT id, pad FROM public.inv_t WHERE ctid >= $1 AND ctid < $2
    ->  Async Foreign Scan on inv_ft (actual rows=136.00 loops=1)
-         Replica: 2
-         Replicas: 3
-         Remote SQL Template: SELECT id, pad FROM public.inv_t
+         Fanout Mode: ctid-slice fan-out
+         Replica: 2 (localhost:5432)
+         Remote SQL: SELECT id, pad FROM public.inv_t WHERE ctid >= $1
 (13 rows)
 
 -- ALTER USER MAPPING must also rebuild the connections.  Point the mapping at

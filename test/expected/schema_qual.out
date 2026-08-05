@@ -40,24 +40,24 @@ ANALYZE sq_app.data_t;
 CREATE FOREIGN TABLE sq_app.data_ft (id int, val int)
   SERVER loopback OPTIONS (table_name 'data_t', min_blocks_per_slice '1');
 EXPLAIN (COSTS OFF) SELECT id FROM sq_app.data_ft ORDER BY id LIMIT 3;
-                              QUERY PLAN                               
------------------------------------------------------------------------
+                                         QUERY PLAN                                          
+---------------------------------------------------------------------------------------------
  Limit
    ->  Sort
          Sort Key: id
          ->  Append
                ->  Async Foreign Scan on data_ft
-                     Replica: 0
-                     Replicas: 3
-                     Remote SQL Template: SELECT id FROM sq_app.data_t
+                     Fanout Mode: ctid-slice fan-out
+                     Replica: 0 (localhost:5432)
+                     Remote SQL: SELECT id FROM sq_app.data_t WHERE ctid < $1
                ->  Async Foreign Scan on data_ft
-                     Replica: 1
-                     Replicas: 3
-                     Remote SQL Template: SELECT id FROM sq_app.data_t
+                     Fanout Mode: ctid-slice fan-out
+                     Replica: 1 (localhost:5432)
+                     Remote SQL: SELECT id FROM sq_app.data_t WHERE ctid >= $1 AND ctid < $2
                ->  Async Foreign Scan on data_ft
-                     Replica: 2
-                     Replicas: 3
-                     Remote SQL Template: SELECT id FROM sq_app.data_t
+                     Fanout Mode: ctid-slice fan-out
+                     Replica: 2 (localhost:5432)
+                     Remote SQL: SELECT id FROM sq_app.data_t WHERE ctid >= $1
 (16 rows)
 
 SELECT count(*), sum(id) FROM sq_app.data_ft;
@@ -89,24 +89,24 @@ CREATE FOREIGN TABLE sq_thing_ft (id int, val int)
   SERVER loopback
   OPTIONS (schema_name 'sq_other', table_name 'thing_t', min_blocks_per_slice '1');
 EXPLAIN (COSTS OFF) SELECT id FROM sq_thing_ft ORDER BY id LIMIT 3;
-                                QUERY PLAN                                
---------------------------------------------------------------------------
+                                           QUERY PLAN                                           
+------------------------------------------------------------------------------------------------
  Limit
    ->  Sort
          Sort Key: id
          ->  Append
                ->  Async Foreign Scan on sq_thing_ft
-                     Replica: 0
-                     Replicas: 3
-                     Remote SQL Template: SELECT id FROM sq_other.thing_t
+                     Fanout Mode: ctid-slice fan-out
+                     Replica: 0 (localhost:5432)
+                     Remote SQL: SELECT id FROM sq_other.thing_t WHERE ctid < $1
                ->  Async Foreign Scan on sq_thing_ft
-                     Replica: 1
-                     Replicas: 3
-                     Remote SQL Template: SELECT id FROM sq_other.thing_t
+                     Fanout Mode: ctid-slice fan-out
+                     Replica: 1 (localhost:5432)
+                     Remote SQL: SELECT id FROM sq_other.thing_t WHERE ctid >= $1 AND ctid < $2
                ->  Async Foreign Scan on sq_thing_ft
-                     Replica: 2
-                     Replicas: 3
-                     Remote SQL Template: SELECT id FROM sq_other.thing_t
+                     Fanout Mode: ctid-slice fan-out
+                     Replica: 2 (localhost:5432)
+                     Remote SQL: SELECT id FROM sq_other.thing_t WHERE ctid >= $1
 (16 rows)
 
 SELECT count(*), sum(id) FROM sq_thing_ft;
@@ -138,24 +138,24 @@ CREATE FOREIGN TABLE sq_mixed_ft (id int, val int)
   SERVER loopback
   OPTIONS (schema_name 'SqMixed', table_name 'MixTbl', min_blocks_per_slice '1');
 EXPLAIN (COSTS OFF) SELECT id FROM sq_mixed_ft ORDER BY id LIMIT 3;
-                                 QUERY PLAN                                 
-----------------------------------------------------------------------------
+                                            QUERY PLAN                                            
+--------------------------------------------------------------------------------------------------
  Limit
    ->  Sort
          Sort Key: id
          ->  Append
                ->  Async Foreign Scan on sq_mixed_ft
-                     Replica: 0
-                     Replicas: 3
-                     Remote SQL Template: SELECT id FROM "SqMixed"."MixTbl"
+                     Fanout Mode: ctid-slice fan-out
+                     Replica: 0 (localhost:5432)
+                     Remote SQL: SELECT id FROM "SqMixed"."MixTbl" WHERE ctid < $1
                ->  Async Foreign Scan on sq_mixed_ft
-                     Replica: 1
-                     Replicas: 3
-                     Remote SQL Template: SELECT id FROM "SqMixed"."MixTbl"
+                     Fanout Mode: ctid-slice fan-out
+                     Replica: 1 (localhost:5432)
+                     Remote SQL: SELECT id FROM "SqMixed"."MixTbl" WHERE ctid >= $1 AND ctid < $2
                ->  Async Foreign Scan on sq_mixed_ft
-                     Replica: 2
-                     Replicas: 3
-                     Remote SQL Template: SELECT id FROM "SqMixed"."MixTbl"
+                     Fanout Mode: ctid-slice fan-out
+                     Replica: 2 (localhost:5432)
+                     Remote SQL: SELECT id FROM "SqMixed"."MixTbl" WHERE ctid >= $1
 (16 rows)
 
 SELECT count(*), sum(id) FROM sq_mixed_ft;

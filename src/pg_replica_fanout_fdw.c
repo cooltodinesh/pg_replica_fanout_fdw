@@ -1436,8 +1436,17 @@ repfdwForeignAsyncNotify(AsyncRequest *areq)
 
 /*
  * repfdwExplainForeignScan
- *		Per-child EXPLAIN: which replica this scan targets (of how many) and its
- *		remote SQL template.  N such Foreign Scans appear under the Append.
+ *		Per-node EXPLAIN.  Always names the "Fanout Mode".  A serve-local node
+ *		shows only its local SQL; a fan-out node shows which replica (index +
+ *		host:port) it targets and the remote SQL template it
+ *		runs -- with the ctid block-range bound shown as the $1/$2 bind
+ *		placeholders the executor fills per slice (RepFdwBuildBoundedSql, the
+ *		very function that builds the executed SQL, renders these lines, so
+ *		EXPLAIN and execution can't drift).  The count(*) combine node instead
+ *		lists the per-slice template for every replica it fans a partial count
+ *		to.  The concrete $1/$2 values differ per slice and aren't known until
+ *		execution; see the docs for how to log the actual bound SQL on a
+ *		replica.
  */
 static void
 repfdwExplainForeignScan(ForeignScanState *node, ExplainState *es)
@@ -1447,21 +1456,19 @@ repfdwExplainForeignScan(ForeignScanState *node, ExplainState *es)
 	char	   *sql_template = strVal(linitial(fdw_private));
 	char	   *remote_pred = strVal(lthird(fdw_private));
 	bool		is_count_agg = boolVal(lfourth(fdw_private));
+	Oid			foreigntableid = intVal(list_nth(fdw_private, 4));
 	int			my_index = intVal(list_nth(fdw_private, 5));
 	int			nreplicas = intVal(list_nth(fdw_private, 6));
 	RepFdwFanoutMode mode = (RepFdwFanoutMode) intVal(list_nth(fdw_private, 7));
+	RepFdwOptions *opts;
+	RepFdwCtidBound nobound = {0};
+
+	/* Always name the execution mode. */
+	ExplainPropertyText("Fanout Mode", RepFdwModeName(mode), es);
 
 	/*
-	 * The default ctid-slice fan-out is the norm and prints no mode line (so
-	 * existing plans are unchanged); serve-local and value-split call
-	 * themselves out.
-	 */
-	if (mode != REPFDW_MODE_CTID_SLICE)
-		ExplainPropertyText("Fanout Mode", RepFdwModeName(mode), es);
-
-	/*
-	 * A serve-local node is a single scan of the local table -- no replica
-	 * fan-out -- so the per-replica index lines don't apply.
+	 * A serve-local node is a single scan of the co-located local table -- no
+	 * replica fan-out, no ctid slicing -- so only its local SQL applies.
 	 */
 	if (mode == REPFDW_MODE_SERVE_LOCAL)
 	{
@@ -1474,22 +1481,77 @@ repfdwExplainForeignScan(ForeignScanState *node, ExplainState *es)
 		return;
 	}
 
-	/* Per-child scan shows its replica index; the agg node fans to all. */
-	if (!is_count_agg)
-		ExplainPropertyInteger("Replica", NULL, my_index, es);
-	ExplainPropertyInteger("Replicas", NULL, nreplicas, es);
+	RepFdwGetOptions(foreigntableid, &opts);
 
 	/*
-	 * Fold the pushed predicate into the same "Remote SQL Template" line
-	 * (rather than a new label), mirroring postgres_fdw's single "Remote SQL"
-	 * line.  The internal ctid $1/$2 slice bound is omitted here.
+	 * count(*) combine node: it fans a partial count(*) to every participating
+	 * slice and sums the results, so list the SQL template each slice runs --
+	 * with its ctid block-range bound as the $1/$2 bind placeholders.
 	 */
-	if (remote_pred[0] != '\0')
-		ExplainPropertyText("Remote SQL Template",
-							psprintf("%s WHERE %s", sql_template, remote_pred),
+	if (is_count_agg)
+	{
+		BlockNumber nblocks = RepFdwGetNBlocks(opts->schema_name,
+											   opts->table_name);
+		RepFdwCtidBound *bounds;
+		int			P = RepFdwComputeSlices(nblocks, nreplicas,
+											opts->min_blocks_per_slice, &bounds);
+		int			i;
+
+		for (i = 0; i < P; i++)
+		{
+			RepHostPort *hp = (RepHostPort *) list_nth(opts->replicas, i);
+			char	   *label = psprintf("Remote SQL (replica %d @ %s:%d)",
+										 i, hp->host, hp->port);
+
+			ExplainPropertyText(label,
+								RepFdwBuildBoundedSql(sql_template, remote_pred,
+													  &bounds[i]),
+								es);
+		}
+		return;
+	}
+
+	/* Per-child scan: identify which replica (index + endpoint) it targets. */
+	if (my_index >= 0 && my_index < list_length(opts->replicas))
+	{
+		RepHostPort *hp = (RepHostPort *) list_nth(opts->replicas, my_index);
+
+		ExplainPropertyText("Replica",
+							psprintf("%d (%s:%d)", my_index, hp->host, hp->port),
 							es);
+	}
 	else
-		ExplainPropertyText("Remote SQL Template", sql_template, es);
+		ExplainPropertyInteger("Replica", NULL, my_index, es);
+
+	/*
+	 * The remote SQL this child runs.  A ctid slice appends its own block-range
+	 * bound as the $1/$2 bind placeholders the executor fills; value-split
+	 * carries its value chunk in remote_pred already and has no ctid bound.
+	 */
+	if (mode == REPFDW_MODE_CTID_SLICE)
+	{
+		BlockNumber nblocks = RepFdwGetNBlocks(opts->schema_name,
+											   opts->table_name);
+		RepFdwCtidBound *bounds;
+		int			P = RepFdwComputeSlices(nblocks, nreplicas,
+											opts->min_blocks_per_slice, &bounds);
+
+		if (my_index < P)
+			ExplainPropertyText("Remote SQL",
+								RepFdwBuildBoundedSql(sql_template, remote_pred,
+													  &bounds[my_index]),
+								es);
+		else
+			ExplainPropertyText("Remote SQL",
+								psprintf("(idle: table has only %d slice(s), fewer than replica %d)",
+										 P, my_index),
+								es);
+	}
+	else						/* VALUE_SPLIT */
+		ExplainPropertyText("Remote SQL",
+							RepFdwBuildBoundedSql(sql_template, remote_pred,
+												  &nobound),
+							es);
 }
 
 static bool
