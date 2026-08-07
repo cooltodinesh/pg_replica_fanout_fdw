@@ -42,6 +42,101 @@ fan-out (see "Execution plan selection"). For a big fan-out scan it dispatches
 per-slice queries over libpq and merges the results. To have the coordinator
 contribute fan-out I/O too, just list it in `replicas` like any other node.
 
+## Requirements
+
+- **PostgreSQL 19+**, built from source (this uses `PQsetChunkedRowsMode`/
+  `PGRES_TUPLES_CHUNK`, the `libpqsrv_*` helpers, and the resource-owner
+  `CreateWaitEventSet`). Build the extension against the **same** server's
+  `pg_config` — a version mismatch will fail to load with a magic-block error.
+- **libpq** (client library + headers) available to that `pg_config`; the module
+  links `-lpq` and opens libpq connections to the replicas at runtime.
+- A **physical streaming-replication cluster**: one primary and N hot standbys
+  built from it (`pg_basebackup`), all byte-identical. The **coordinator** (where
+  you `CREATE EXTENSION` and run queries) must **itself be an instance of that
+  cluster** — primary or standby — with the target table present locally. That
+  local copy is not optional: its block count sizes the ctid slices (see
+  "Known limitations"). List the replicas the FDW should fan out to in the
+  `replicas` option; include the coordinator's own address there too if you want
+  it to carry a slice.
+
+## Building and installing
+
+From the extension directory (`pg_replica_fanout_fdw/`):
+
+```sh
+# Point PG_CONFIG at the target server's pg_config (omit if it's already on PATH).
+make        PG_CONFIG=/path/to/pg-install/bin/pg_config
+make install PG_CONFIG=/path/to/pg-install/bin/pg_config   # may need sudo if the install tree is root-owned
+```
+
+This builds `pg_replica_fanout_fdw.so` and installs it plus the `.control` and
+`.sql` files into the server's `$libdir`/extension dirs. No
+`shared_preload_libraries` entry is needed — the FDW handler is loaded on demand
+by `CREATE EXTENSION` / first use.
+
+Then, in the coordinator database:
+
+```sql
+CREATE EXTENSION pg_replica_fanout_fdw;
+```
+
+To run the regression suite against a running server (loopback harness — no real
+standbys required), see "Testing" below.
+
+## Setting up the replica cluster (if you don't already have one)
+
+The FDW consumes an existing streaming-replication cluster; it does not create
+one. A minimal local setup, all on one host with distinct ports:
+
+```sh
+BIN=/path/to/pg-install/bin
+
+# 1. Primary
+$BIN/initdb -D /data/primary
+echo "wal_level=replica"            >> /data/primary/postgresql.conf
+echo "max_wal_senders=10"           >> /data/primary/postgresql.conf
+echo "listen_addresses='*'"         >> /data/primary/postgresql.conf   # or specific IPs
+# allow replication + client connections in /data/primary/pg_hba.conf, then:
+$BIN/pg_ctl -D /data/primary -o "-p 5432" -l /data/primary/log start
+
+# 2. Each standby (repeat per replica, distinct -D and port)
+$BIN/pg_basebackup -h <primary-host> -p 5432 -D /data/standby1 -R -X stream
+$BIN/pg_ctl -D /data/standby1 -o "-p 5433" -l /data/standby1/log start   # hot_standby=on is the default
+```
+
+`pg_basebackup -R` writes the `primary_conninfo` so each standby streams
+automatically. Confirm every standby is caught up before querying
+(`SELECT pg_last_wal_replay_lsn();` on each vs. `pg_current_wal_lsn()` on the
+primary). Load the table you want to scan on the primary; it replicates to every
+standby (and is present on the coordinator, being a cluster instance).
+
+## Creating the FDW objects and verifying
+
+On the coordinator, against the database that has the local table:
+
+```sql
+CREATE EXTENSION IF NOT EXISTS pg_replica_fanout_fdw;
+
+CREATE SERVER my_replicas FOREIGN DATA WRAPPER pg_replica_fanout_fdw
+  OPTIONS (replicas 'standby1:5433,standby2:5434,standby3:5435');
+
+CREATE USER MAPPING FOR CURRENT_USER SERVER my_replicas
+  OPTIONS (user 'repl_reader', password '...');   -- one credential set for all replicas
+
+CREATE FOREIGN TABLE big_ft (id int, val int, pad text)
+  SERVER my_replicas OPTIONS (table_name 'big');   -- schema_name defaults to the FT's schema
+
+-- Verify: the plan should be an Append of per-replica Async Foreign Scans,
+-- each with a disjoint ctid range ($1/$2) in its Remote SQL.
+EXPLAIN (VERBOSE, COSTS OFF) SELECT count(*) FROM big_ft;
+SELECT count(*) FROM big_ft;   -- must match SELECT count(*) FROM big
+```
+
+If a replica is unreachable the scan errors and names it (respecting
+`connect_timeout`) rather than returning a partial result. See "Verifying the
+scan-side I/O split" for confirming the block-range split actually reduces
+per-replica I/O.
+
 ## Options
 
 | Option | Object | Default | Notes |
